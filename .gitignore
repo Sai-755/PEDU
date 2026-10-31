@@ -1,0 +1,5 @@
+# Local secrets and generated dependencies
+server/.env
+client/.env.local
+**/node_modules/
+**/dist/
