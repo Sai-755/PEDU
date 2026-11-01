@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { rateLimit } from 'express-rate-limit';
 import db from '../db.js';
-import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 
 const router = Router();
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
@@ -68,47 +68,49 @@ function verificationUrl(userId, email) {
 }
 
 async function sendVerificationEmail(email, url) {
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_PASS, EMAIL_FROM } = process.env;
-  const password = SMTP_PASSWORD || SMTP_PASS;
+  const apiKey = process.env.RESEND_API_KEY;
+  const fromEmail = process.env.EMAIL_FROM || 'PVGJ <onboarding@resend.dev>';
 
-  if (!SMTP_HOST || !SMTP_USER || !password || !EMAIL_FROM) {
-    const missing = [];
-    if (!SMTP_HOST) missing.push('SMTP_HOST');
-    if (!SMTP_USER) missing.push('SMTP_USER');
-    if (!password) missing.push('SMTP_PASSWORD (or SMTP_PASS)');
-    if (!EMAIL_FROM) missing.push('EMAIL_FROM');
-    
-    console.error(`[SMTP CONFIG ERROR] Missing environment variable(s): ${missing.join(', ')}`);
-
+  if (!apiKey) {
     if (process.env.NODE_ENV === 'production') {
-      throw new Error(`Email verification is not configured. Missing: ${missing.join(', ')}`);
+      console.error('[EMAIL CONFIG ERROR] Missing RESEND_API_KEY');
+      throw new Error('Email verification is not configured. Missing: RESEND_API_KEY');
     }
     console.info('PVGJ email verification link for ' + email + ': ' + url);
     return;
   }
 
-  const port = Number(SMTP_PORT || 587);
-  const transport = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port,
-    secure: port === 465,
-    auth: { user: SMTP_USER, pass: password },
-    connectionTimeout: 10000,
-    greetingTimeout: 10000,
-    socketTimeout: 15000
-  });
+  const resend = new Resend(apiKey);
 
   try {
-    const info = await transport.sendMail({
-      from: EMAIL_FROM,
-      to: email,
+    const { data, error } = await resend.emails.send({
+      from: fromEmail,
+      to: [email],
       subject: 'Verify your PVGJ account',
-      text: 'Verify your email within 24 hours: ' + url,
-      html: '<p>Welcome to PVGJ.</p><p><a href="' + url + '">Verify your email address</a></p><p>This link expires in 24 hours.</p>'
+      html: `
+        <div style="font-family: Arial, sans-serif; padding: 24px; color: #173b2d; max-width: 500px; margin: auto; border: 1px solid #e1e8df; border-radius: 12px;">
+          <h2 style="color: #173b2d;">Welcome to PVGJ</h2>
+          <p>Please click the button below to verify your email address and activate your learner account:</p>
+          <div style="margin: 28px 0;">
+            <a href="${url}" style="background-color: #173b2d; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+              Verify Email Address
+            </a>
+          </div>
+          <p style="color: #666; font-size: 13px;">This link will expire in 24 hours.</p>
+          <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;" />
+          <p style="font-size: 11px; color: #999;">If you didn't create an account with PVGJ, please disregard this email.</p>
+        </div>
+      `
     });
-    console.log('[SMTP SUCCESS] Email sent to:', email, 'Message ID:', info.messageId);
+
+    if (error) {
+      console.error('[RESEND API ERROR]:', error);
+      throw new Error(error.message);
+    }
+
+    console.log('[EMAIL SUCCESS] Verification email sent via Resend. Message ID:', data?.id);
   } catch (err) {
-    console.error('[SMTP TRANSPORT ERROR] Error occurred while sending email:', err);
+    console.error('[EMAIL DISPATCH ERROR]:', err.message);
     throw err;
   }
 }
