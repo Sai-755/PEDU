@@ -3,3 +3,7 @@ server/.env
 client/.env.local
 **/node_modules/
 **/dist/
+
+server/.env.production
+client/.env
+client/.env.production

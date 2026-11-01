@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
+import splashLogo from './assets/pvgj-splash-logo.png';
 import {
   ArrowDownRight, ArrowRight, ArrowUpRight, BookOpen, Brain, BriefcaseBusiness,
-  CheckCircle2, ChevronDown, Code2, Compass, GraduationCap, Landmark, Menu,
+  CheckCircle2, Code2, Compass, GraduationCap, Landmark, Menu,
   Newspaper, Search, ShieldCheck, Sparkles, X, Zap
 } from 'lucide-react';
 
@@ -25,22 +26,12 @@ const seedResources = [
   { type: 'CAREER TOOLKIT', title: 'Prepare for your next opportunity', description: 'Organize your skills, improve your resume, and practise interview answers.', label: 'Guidance', slug: 'guidance' }
 ];
 
-const serviceEntries = {
-  'technical-skills': [{ title: 'Coding foundations', detail: 'Start with HTML, CSS, JavaScript, and hands-on practice.' }, { title: 'Web development', detail: 'Plan and build responsive websites one project at a time.' }, { title: 'Python and data basics', detail: 'Learn programming logic, data handling, and beginner-friendly AI concepts.' }],
-  'current-affairs': [{ title: 'Daily news brief', detail: 'Review important national and international updates.' }, { title: 'Government schemes', detail: 'Understand major public programs and who they support.' }, { title: 'Quick knowledge checks', detail: 'Reinforce the week with short revision quizzes.' }],
-  'general-knowledge': [{ title: 'Indian polity', detail: 'Explore the Constitution, institutions, and civic foundations.' }, { title: 'History and geography', detail: 'Study key timelines, places, and events with clear summaries.' }, { title: 'Science and economy', detail: 'Build useful foundations for exams and everyday learning.' }],
-  'job-alerts': [{ title: 'Government recruitment', detail: 'Browse openings, eligibility details, and important dates.' }, { title: 'State and central exams', detail: 'Find recruitment updates from public departments and commissions.' }, { title: 'Career opportunities', detail: 'Explore internships and private-sector openings as available.' }],
-  'study-materials': [{ title: 'Revision notes', detail: 'Review concise topic summaries and learning guides.' }, { title: 'Practice worksheets', detail: 'Strengthen understanding with focused exercises.' }, { title: 'Previous-year papers', detail: 'Use past questions to learn exam formats and pacing.' }],
-  'government-exams': [{ title: 'UPSC and state PSC', detail: 'Organize syllabus topics and build a steady preparation plan.' }, { title: 'SSC and banking', detail: 'Practise aptitude, reasoning, English, and general awareness.' }, { title: 'Mock tests and review', detail: 'Check your progress and learn from explained answers.' }],
-  guidance: [{ title: 'Career planning', detail: 'Explore pathways that suit your strengths and goals.' }, { title: 'Resume preparation', detail: 'Present your skills and experience clearly.' }, { title: 'Interview practice', detail: 'Prepare thoughtful answers and build confidence.' }]
-};
-
 const iconMap = { Code2, Newspaper, Brain, BriefcaseBusiness, BookOpen, Landmark, Compass };
 const accents = ['mint', 'gold', 'blue', 'lavender', 'teal', 'peach', 'lilac'];
 
 function Brand({ light = false }) {
   return <a className={`brand ${light ? 'brand-light' : ''}`} href="#home" aria-label="PVGJ home">
-    <span className="brand-mark"><GraduationCap size={25} strokeWidth={1.8}/></span>
+    <span className="brand-mark brand-mark-image"><img src="/pvgj-logo-light.png" alt="" /></span>
     <span className="brand-copy"><strong>PVGJ</strong><small>EDUCATIONAL INSTITUTIONS</small></span>
   </a>;
 }
@@ -57,11 +48,17 @@ const [menuOpen, setMenuOpen] = useState(false);
   const [formState, setFormState] = useState({ loading: false, message: '', error: false });
   const [apiStatus, setApiStatus] = useState('demo');
   const [showSplash, setShowSplash] = useState(true);
-  const [expandedService, setExpandedService] = useState('');
 
   useEffect(() => {
     const timer = window.setTimeout(() => setShowSplash(false), 2100);
     return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (window.location.hash !== '#guidance') return;
+    const course = new URLSearchParams(window.location.search).get('course');
+    if (course) setForm((current) => ({ ...current, topic: 'technical skills', message: 'I would like to know more about ' + course.slice(0, 180) + '.' }));
+    setShowGuidance(true);
   }, []);
 
   
@@ -100,7 +97,7 @@ useEffect(() => {
       servicesData.forEach((item) => {
         const match = resolvedServices.findIndex((service) => service.title.toLowerCase() === String(item.title || '').toLowerCase());
         const fallback = match >= 0 ? resolvedServices[match] : null;
-        const normalized = { ...fallback, ...item, slug: item.slug || fallback?.slug || 'service-' + item.id, icon: item.icon || fallback?.icon || 'BookOpen', category: item.category || fallback?.category || 'Explore', tags: Array.isArray(item.tags) ? item.tags : (fallback?.tags || []) };
+        const normalized = { ...fallback, ...item, slug: item.slug || fallback?.slug || String(item.title || 'service-' + item.id).toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''), icon: item.icon || fallback?.icon || 'BookOpen', category: item.category || fallback?.category || 'Explore', tags: Array.isArray(item.tags) ? item.tags : (fallback?.tags || []) };
         if (match >= 0) resolvedServices[match] = normalized; else resolvedServices.push(normalized);
       });
       setServices(resolvedServices.map((service, index) => ({ ...service, number: String(index + 1).padStart(2, '0') })));
@@ -187,14 +184,14 @@ const filteredResources = useMemo(() => {
     }
   }
 
-  return <><div className={showSplash ? "pvgj-splash is-visible" : "pvgj-splash"} aria-hidden={!showSplash}><img src="/pvgj-logo.png" alt="PVGJ Educational Institutions" /><div className="splash-caption">LEARN <span></span> PREPARE <span></span> PROGRESS</div><div className="splash-progress"><i /></div></div><div className="site-shell" id="home">
+  return <><div className={showSplash ? "pvgj-splash is-visible" : "pvgj-splash"} aria-hidden={!showSplash}><img src={splashLogo} alt="PVGJ Educational Institutions logo" /><div className="splash-caption">LEARN <span></span> PREPARE <span></span> PROGRESS</div><div className="splash-progress"><i /></div></div><div className="site-shell" id="home">
     <div className="announcement"><Sparkles size={14}/><span>Your next step starts with what you learn today.</span><a href="#services">Explore PVGJ <ArrowRight size={13}/></a></div>
     <header className="site-header">
       <div className="nav-wrap">
         <Brand/>
         <nav className={menuOpen ? 'nav-links nav-open' : 'nav-links'} aria-label="Main navigation">
           <a href="#services" onClick={() => setMenuOpen(false)}>Explore</a>
-          <a href="#resources" onClick={() => setMenuOpen(false)}>Resources</a>
+          <a href="#resources" onClick={() => setMenuOpen(false)}>Resources</a><a href="/learn" onClick={() => setMenuOpen(false)}>Learning hub</a>
           <a href="/jobs" onClick={() => setMenuOpen(false)}>Job alerts</a>
           <a href="/about" onClick={() => setMenuOpen(false)}>About PVGJ</a>
           <a href="/jobs" onClick={() => setMenuOpen(false)}>
@@ -209,7 +206,7 @@ const filteredResources = useMemo(() => {
       </div>
     </header>
 
-    <main>
+    <main id="main-content">
       <section className="hero">
         <div className="hero-orb orb-one"></div><div className="hero-orb orb-two"></div>
         <div className="hero-grid">
@@ -260,15 +257,13 @@ const filteredResources = useMemo(() => {
         <div className="services-grid">
           {filteredServices.map((service, index) => {
             const Icon = iconMap[service.icon] || Sparkles;
-            const entries = serviceEntries[service.slug] || (service.tags?.length ? service.tags.map((title) => ({ title, detail: service.description })) : [{ title: 'Explore ' + service.title, detail: service.description || 'Discover the key ideas, resources, and next steps in this area.' }, { title: 'Practice the fundamentals', detail: 'Work through guided examples and build your confidence step by step.' }, { title: 'Plan your next step', detail: 'Use your new knowledge in study, exam preparation, or career planning.' }]);
             return <motion.article className={`service-card accent-${accents[index % accents.length]}`} key={service.slug} initial={{ opacity: 0, y: 14 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true, amount: .15 }} transition={{ duration: .35, delay: (index % 3) * .06 }}>
               <div className="card-top"><span className="service-icon"><Icon size={22} strokeWidth={1.8}/></span><span className="service-number">{service.number}</span></div>
               <div className="service-category">{service.category}</div>
               <h3>{service.title}</h3>
               <p>{service.description}</p>
               <div className="tag-list">{(service.tags || []).map((tag) => <span key={tag}>{tag}</span>)}</div>
-              <button type="button" className="card-link service-expand-button" aria-expanded={expandedService === service.slug} onClick={() => setExpandedService(expandedService === service.slug ? '' : service.slug)}>{expandedService === service.slug ? 'Hide offerings' : 'Explore offerings'} <ChevronDown size={16}/></button>
-              {expandedService === service.slug && <div className="service-offerings">{entries.map((entry) => <article key={entry.title}><span></span><div><b>{entry.title}</b><small>{entry.detail}</small></div></article>)}{service.slug === 'job-alerts' && <a href="/jobs" className="offerings-cta">Browse current job alerts <ArrowRight size={14}/></a>}{service.slug === 'guidance' && <button type="button" className="offerings-cta" onClick={() => setShowGuidance(true)}>Request personal guidance <ArrowRight size={14}/></button>}</div>}
+              <a className="card-link" href={'/#/services/' + encodeURIComponent(service.slug)}>View service details <ArrowRight size={16}/></a>
             </motion.article>;
           })}
         </div>

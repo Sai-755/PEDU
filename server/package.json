@@ -17,9 +17,10 @@
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^8.9.5",
     "mysql2": "^3.24.6",
+    "nodemailer": "^10.3.1",
     "rss-parser": "^3.13.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.9"
+    "nodemon": "^3.1.14"
   }
 }
