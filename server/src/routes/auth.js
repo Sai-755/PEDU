@@ -68,7 +68,9 @@ function verificationUrl(userId, email) {
 
 async function sendVerificationEmail(email, url) {
   const apiKey = process.env.BREVO_API_KEY || process.env.BREVO_KEY;
-  const fromEmail = process.env.EMAIL_FROM || 'pvgjeducation@gmail.com';
+  const rawFrom = process.env.EMAIL_FROM || 'pvgjeducation@gmail.com';
+  // Extracts pure email address even if formatted like "PVGJ <email@domain.com>"
+  const fromEmail = (rawFrom.match(/<([^>]+)>/) ? rawFrom.match(/<([^>]+)>/)[1] : rawFrom).trim();
 
   if (!apiKey) {
     if (process.env.NODE_ENV === 'production') {
