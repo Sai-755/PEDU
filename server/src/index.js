@@ -22,7 +22,7 @@ if (trustProxyHops) {
 }
 
 if (process.env.NODE_ENV === 'production') {
-  const required = ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME', 'JWT_SECRET', 'ADMIN_EMAIL', 'ADMIN_PASSWORD_HASH', 'RESEND_API_KEY', 'EMAIL_FROM'];
+  const required = ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME', 'JWT_SECRET', 'ADMIN_EMAIL', 'ADMIN_PASSWORD_HASH', 'BREVO_API_KEY', 'EMAIL_FROM'];
   const missing = required.filter((key) => !process.env[key] || /replace-with|yourdomain\.com|example\.com/i.test(process.env[key]));
   const invalid = [];
   try {
