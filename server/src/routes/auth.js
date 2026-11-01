@@ -45,6 +45,7 @@ function issueToken(user) {
   if (!process.env.JWT_SECRET) throw new Error('Authentication is not configured. Set JWT_SECRET in server/.env.');
   return jwt.sign({ sub: String(user.id), role: 'learner', email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d', issuer: 'pvgj-api', audience: 'pvgj-user' });
 }
+
 function currentUser(req) {
   const match = (req.headers.authorization || '').match(/^Bearer\s+(\S+)$/i);
   if (!match || !process.env.JWT_SECRET) return null;
@@ -53,6 +54,7 @@ function currentUser(req) {
     return payload.role === 'learner' ? payload : null;
   } catch { return null; }
 }
+
 function requireUser(req, res) {
   const user = currentUser(req);
   if (!user) { res.status(401).json({ message: 'Please sign in to continue.' }); return null; }
@@ -64,33 +66,87 @@ function verificationUrl(userId, email) {
   const apiBase = (process.env.API_BASE_URL || 'http://localhost:5000/api').replace(/\/+$/, '');
   return apiBase + '/auth/verify-email?token=' + encodeURIComponent(token);
 }
+
 async function sendVerificationEmail(email, url) {
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM } = process.env;
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASSWORD || !EMAIL_FROM) {
-    if (process.env.NODE_ENV === 'production') throw new Error('Email verification is not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD, and EMAIL_FROM.');
-    console.info('PVGJ email verification link for ' + email + ': ' + url); return;
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_PASS, EMAIL_FROM } = process.env;
+  const password = SMTP_PASSWORD || SMTP_PASS;
+
+  if (!SMTP_HOST || !SMTP_USER || !password || !EMAIL_FROM) {
+    const missing = [];
+    if (!SMTP_HOST) missing.push('SMTP_HOST');
+    if (!SMTP_USER) missing.push('SMTP_USER');
+    if (!password) missing.push('SMTP_PASSWORD (or SMTP_PASS)');
+    if (!EMAIL_FROM) missing.push('EMAIL_FROM');
+    
+    console.error(`[SMTP CONFIG ERROR] Missing environment variable(s): ${missing.join(', ')}`);
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(`Email verification is not configured. Missing: ${missing.join(', ')}`);
+    }
+    console.info('PVGJ email verification link for ' + email + ': ' + url);
+    return;
   }
+
   const port = Number(SMTP_PORT || 587);
-  const transport = nodemailer.createTransport({ host: SMTP_HOST, port, secure: port === 465, auth: { user: SMTP_USER, pass: SMTP_PASSWORD } });
-  await transport.sendMail({ from: EMAIL_FROM, to: email, subject: 'Verify your PVGJ account', text: 'Verify your email within 24 hours: ' + url, html: '<p>Welcome to PVGJ.</p><p><a href="' + url + '">Verify your email address</a></p><p>This link expires in 24 hours.</p>' });
+  const transport = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port,
+    secure: port === 465,
+    auth: { user: SMTP_USER, pass: password },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000
+  });
+
+  try {
+    const info = await transport.sendMail({
+      from: EMAIL_FROM,
+      to: email,
+      subject: 'Verify your PVGJ account',
+      text: 'Verify your email within 24 hours: ' + url,
+      html: '<p>Welcome to PVGJ.</p><p><a href="' + url + '">Verify your email address</a></p><p>This link expires in 24 hours.</p>'
+    });
+    console.log('[SMTP SUCCESS] Email sent to:', email, 'Message ID:', info.messageId);
+  } catch (err) {
+    console.error('[SMTP TRANSPORT ERROR] Error occurred while sending email:', err);
+    throw err;
+  }
 }
+
 router.post('/signup', authLimiter, async (req, res, next) => {
   try {
     const { name, email, password } = req.body || {};
     const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-    if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 120 || !emailPattern.test(cleanEmail) || cleanEmail.length > 254 || typeof password !== 'string' || password.length < 8 || password.length > 128) return res.status(400).json({ message: 'Enter your name, a valid email, and a password of at least 8 characters.' });
+    if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 120 || !emailPattern.test(cleanEmail) || cleanEmail.length > 254 || typeof password !== 'string' || password.length < 8 || password.length > 128) {
+      return res.status(400).json({ message: 'Enter your name, a valid email, and a password of at least 8 characters.' });
+    }
     if (!process.env.JWT_SECRET) return res.status(503).json({ message: 'Authentication is not configured. Set JWT_SECRET in server/.env.' });
+    
     await ensureAccountTables();
     const passwordHash = await bcrypt.hash(password, 12);
     const [result] = await db.execute('INSERT INTO users (name, email, password_hash, email_verified_at) VALUES (?, ?, ?, NULL)', [name.trim(), cleanEmail, passwordHash]);
     const url = verificationUrl(result.insertId, cleanEmail);
-    try { await sendVerificationEmail(cleanEmail, url); }
-    catch (error) { await db.execute('DELETE FROM users WHERE id = ? AND email_verified_at IS NULL', [result.insertId]); error.verificationEmailFailed = true; throw error; }
+
+    try {
+      await sendVerificationEmail(cleanEmail, url);
+    } catch (error) {
+      console.error('[SIGNUP ERROR] Email sending failed for user ID', result.insertId, ':', error.message);
+      await db.execute('DELETE FROM users WHERE id = ? AND email_verified_at IS NULL', [result.insertId]);
+      error.verificationEmailFailed = true;
+      throw error;
+    }
+
     res.set('Cache-Control', 'no-store');
-    return res.status(201).json({ message: 'Account created. Check your inbox and follow the verification link before signing in.', verificationUrl: process.env.NODE_ENV === 'production' ? undefined : url });
+    return res.status(201).json({
+      message: 'Account created. Check your inbox and follow the verification link before signing in.',
+      verificationUrl: process.env.NODE_ENV === 'production' ? undefined : url
+    });
   } catch (error) {
     if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'An account with this email already exists. Sign in instead.' });
-    if (error.verificationEmailFailed) return res.status(503).json({ message: 'We could not send the verification email. Check your SMTP settings and try again.' });
+    if (error.verificationEmailFailed) {
+      return res.status(503).json({ message: 'We could not send the verification email. Check your SMTP settings and try again.' });
+    }
+    console.error('[SIGNUP UNHANDLED ERROR]:', error);
     next(error);
   }
 });
@@ -115,6 +171,7 @@ router.get('/verify-email', async (req, res, next) => {
     next(error);
   }
 });
+
 router.post('/login', authLimiter, async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
@@ -195,7 +252,6 @@ router.delete('/saved-jobs/:jobId', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-
 const applicationStatuses = ['Interested', 'Applied', 'Interview', 'Offer', 'Rejected'];
 function validTrackedJobUrl(sourceUrl) {
   try {
@@ -203,6 +259,7 @@ function validTrackedJobUrl(sourceUrl) {
     return ['https:', 'http:'].includes(url.protocol) && /(^|\.)freejobalert\.com$/i.test(url.hostname) && url.pathname.startsWith('/articles/') ? url.href : null;
   } catch { return null; }
 }
+
 router.get('/applications', async (req, res, next) => {
   try {
     const payload = requireUser(req, res); if (!payload) return;
@@ -211,6 +268,7 @@ router.get('/applications', async (req, res, next) => {
     return res.json({ applications: rows });
   } catch (error) { next(error); }
 });
+
 router.post('/applications', async (req, res, next) => {
   try {
     const payload = requireUser(req, res); if (!payload) return;
@@ -222,6 +280,7 @@ router.post('/applications', async (req, res, next) => {
     return res.status(201).json({ tracked: true, id });
   } catch (error) { next(error); }
 });
+
 router.patch('/applications/:jobId', async (req, res, next) => {
   try {
     const payload = requireUser(req, res); if (!payload) return;
@@ -237,6 +296,7 @@ router.patch('/applications/:jobId', async (req, res, next) => {
     return res.json({ updated: true });
   } catch (error) { next(error); }
 });
+
 router.delete('/applications/:jobId', async (req, res, next) => {
   try {
     const payload = requireUser(req, res); if (!payload) return;
@@ -245,6 +305,7 @@ router.delete('/applications/:jobId', async (req, res, next) => {
     return res.json({ tracked: false });
   } catch (error) { next(error); }
 });
+
 router.get('/saved-searches', async (req, res, next) => {
   try {
     const payload = requireUser(req, res); if (!payload) return;
@@ -253,6 +314,7 @@ router.get('/saved-searches', async (req, res, next) => {
     return res.json({ searches: rows });
   } catch (error) { next(error); }
 });
+
 router.post('/saved-searches', async (req, res, next) => {
   try {
     const payload = requireUser(req, res); if (!payload) return;
@@ -266,6 +328,7 @@ router.post('/saved-searches', async (req, res, next) => {
     next(error);
   }
 });
+
 router.delete('/saved-searches/:id', async (req, res, next) => {
   try {
     const payload = requireUser(req, res); if (!payload) return;
@@ -274,5 +337,5 @@ router.delete('/saved-searches/:id', async (req, res, next) => {
     return res.json({ saved: false });
   } catch (error) { next(error); }
 });
-export default router;
 
+export default router;
