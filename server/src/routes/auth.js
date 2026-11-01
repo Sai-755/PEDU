@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { rateLimit } from 'express-rate-limit';
 import db from '../db.js';
-import { Resend } from 'resend';
+import * as SibApiV3Sdk from '@getbrevo/brevo';
 
 const router = Router();
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
@@ -68,49 +68,45 @@ function verificationUrl(userId, email) {
 }
 
 async function sendVerificationEmail(email, url) {
-  const apiKey = process.env.RESEND_API_KEY;
-  const fromEmail = process.env.EMAIL_FROM || 'PVGJ <onboarding@resend.dev>';
+  const apiKey = process.env.BREVO_API_KEY || process.env.BREVO_KEY;
+  const fromEmail = process.env.EMAIL_FROM || 'pvgjeducation@gmail.com';
 
   if (!apiKey) {
     if (process.env.NODE_ENV === 'production') {
-      console.error('[EMAIL CONFIG ERROR] Missing RESEND_API_KEY');
-      throw new Error('Email verification is not configured. Missing: RESEND_API_KEY');
+      console.error('[EMAIL CONFIG ERROR] Missing BREVO_API_KEY in environment variables.');
+      throw new Error('Email verification is not configured. Missing: BREVO_API_KEY');
     }
     console.info('PVGJ email verification link for ' + email + ': ' + url);
     return;
   }
 
-  const resend = new Resend(apiKey);
+  const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
+  apiInstance.setApiKey(SibApiV3Sdk.TransactionalEmailsApiApiKeys.apiKey, apiKey);
+
+  const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
+  sendSmtpEmail.subject = 'Verify your PVGJ account';
+  sendSmtpEmail.sender = { name: 'PVGJ', email: fromEmail };
+  sendSmtpEmail.to = [{ email }];
+  sendSmtpEmail.htmlContent = `
+    <div style="font-family: Arial, sans-serif; padding: 24px; color: #173b2d; max-width: 500px; margin: auto; border: 1px solid #e1e8df; border-radius: 12px;">
+      <h2 style="color: #173b2d;">Welcome to PVGJ</h2>
+      <p>Please click the button below to verify your email address and activate your learner account:</p>
+      <div style="margin: 28px 0;">
+        <a href="${url}" style="background-color: #173b2d; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+          Verify Email Address
+        </a>
+      </div>
+      <p style="color: #666; font-size: 13px;">This link will expire in 24 hours.</p>
+      <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;" />
+      <p style="font-size: 11px; color: #999;">If you didn't create an account with PVGJ, please disregard this email.</p>
+    </div>
+  `;
 
   try {
-    const { data, error } = await resend.emails.send({
-      from: fromEmail,
-      to: [email],
-      subject: 'Verify your PVGJ account',
-      html: `
-        <div style="font-family: Arial, sans-serif; padding: 24px; color: #173b2d; max-width: 500px; margin: auto; border: 1px solid #e1e8df; border-radius: 12px;">
-          <h2 style="color: #173b2d;">Welcome to PVGJ</h2>
-          <p>Please click the button below to verify your email address and activate your learner account:</p>
-          <div style="margin: 28px 0;">
-            <a href="${url}" style="background-color: #173b2d; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
-              Verify Email Address
-            </a>
-          </div>
-          <p style="color: #666; font-size: 13px;">This link will expire in 24 hours.</p>
-          <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;" />
-          <p style="font-size: 11px; color: #999;">If you didn't create an account with PVGJ, please disregard this email.</p>
-        </div>
-      `
-    });
-
-    if (error) {
-      console.error('[RESEND API ERROR]:', error);
-      throw new Error(error.message);
-    }
-
-    console.log('[EMAIL SUCCESS] Verification email sent via Resend. Message ID:', data?.id);
+    const response = await apiInstance.sendTransacEmail(sendSmtpEmail);
+    console.log('[EMAIL SUCCESS] Verification email sent via Brevo. Message ID:', response?.body?.messageId || response?.messageId);
   } catch (err) {
-    console.error('[EMAIL DISPATCH ERROR]:', err.message);
+    console.error('[BREVO API ERROR]:', err?.response?.body || err.message);
     throw err;
   }
 }
