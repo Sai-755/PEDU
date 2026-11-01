@@ -3,7 +3,6 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { rateLimit } from 'express-rate-limit';
 import db from '../db.js';
-import * as SibApiV3Sdk from '@getbrevo/brevo';
 
 const router = Router();
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
@@ -80,35 +79,44 @@ async function sendVerificationEmail(email, url) {
     return;
   }
 
-  const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
-  apiInstance.setApiKey(SibApiV3Sdk.TransactionalEmailsApiApiKeys.apiKey, apiKey);
-
-  const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
-  sendSmtpEmail.subject = 'Verify your PVGJ account';
-  sendSmtpEmail.sender = { name: 'PVGJ', email: fromEmail };
-  sendSmtpEmail.to = [{ email }];
-  sendSmtpEmail.htmlContent = `
-    <div style="font-family: Arial, sans-serif; padding: 24px; color: #173b2d; max-width: 500px; margin: auto; border: 1px solid #e1e8df; border-radius: 12px;">
-      <h2 style="color: #173b2d;">Welcome to PVGJ</h2>
-      <p>Please click the button below to verify your email address and activate your learner account:</p>
-      <div style="margin: 28px 0;">
-        <a href="${url}" style="background-color: #173b2d; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
-          Verify Email Address
-        </a>
+  const payload = {
+    sender: { name: 'PVGJ', email: fromEmail },
+    to: [{ email }],
+    subject: 'Verify your PVGJ account',
+    htmlContent: `
+      <div style="font-family: Arial, sans-serif; padding: 24px; color: #173b2d; max-width: 500px; margin: auto; border: 1px solid #e1e8df; border-radius: 12px;">
+        <h2 style="color: #173b2d;">Welcome to PVGJ</h2>
+        <p>Please click the button below to verify your email address and activate your learner account:</p>
+        <div style="margin: 28px 0;">
+          <a href="${url}" style="background-color: #173b2d; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+            Verify Email Address
+          </a>
+        </div>
+        <p style="color: #666; font-size: 13px;">This link will expire in 24 hours.</p>
+        <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;" />
+        <p style="font-size: 11px; color: #999;">If you didn't create an account with PVGJ, please disregard this email.</p>
       </div>
-      <p style="color: #666; font-size: 13px;">This link will expire in 24 hours.</p>
-      <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;" />
-      <p style="font-size: 11px; color: #999;">If you didn't create an account with PVGJ, please disregard this email.</p>
-    </div>
-  `;
+    `
+  };
 
-  try {
-    const response = await apiInstance.sendTransacEmail(sendSmtpEmail);
-    console.log('[EMAIL SUCCESS] Verification email sent via Brevo. Message ID:', response?.body?.messageId || response?.messageId);
-  } catch (err) {
-    console.error('[BREVO API ERROR]:', err?.response?.body || err.message);
-    throw err;
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'accept': 'application/json',
+      'api-key': apiKey,
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error('[BREVO REST ERROR]:', response.status, errorBody);
+    throw new Error(`Brevo HTTP error: ${response.status} - ${errorBody}`);
   }
+
+  const result = await response.json();
+  console.log('[EMAIL SUCCESS] Verification email sent via Brevo. Message ID:', result.messageId);
 }
 
 router.post('/signup', authLimiter, async (req, res, next) => {
