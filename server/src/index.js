@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -23,7 +22,7 @@ if (trustProxyHops) {
 }
 
 if (process.env.NODE_ENV === 'production') {
-  const required = ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME', 'JWT_SECRET', 'ADMIN_EMAIL', 'ADMIN_PASSWORD_HASH', 'SMTP_HOST', 'SMTP_USER', 'SMTP_PASSWORD', 'EMAIL_FROM'];
+  const required = ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME', 'JWT_SECRET', 'ADMIN_EMAIL', 'ADMIN_PASSWORD_HASH', 'RESEND_API_KEY', 'EMAIL_FROM'];
   const missing = required.filter((key) => !process.env[key] || /replace-with|yourdomain\.com|example\.com/i.test(process.env[key]));
   const invalid = [];
   try {
@@ -37,7 +36,6 @@ if (process.env.NODE_ENV === 'production') {
   })) invalid.push('CLIENT_ORIGIN');
   if (process.env.JWT_SECRET && process.env.JWT_SECRET.length < 32) invalid.push('JWT_SECRET (use at least 32 characters)');
   if (process.env.ADMIN_PASSWORD_HASH && !/^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(process.env.ADMIN_PASSWORD_HASH)) invalid.push('ADMIN_PASSWORD_HASH (must be a bcrypt hash)');
-  if (process.env.SMTP_PORT && (!Number.isInteger(Number(process.env.SMTP_PORT)) || Number(process.env.SMTP_PORT) < 1 || Number(process.env.SMTP_PORT) > 65535)) invalid.push('SMTP_PORT');
   const issues = [...missing.map((key) => key + ' is required'), ...invalid.map((key) => key + ' is invalid')];
   if (issues.length) throw new Error('Production configuration is incomplete: ' + issues.join('; '));
 }
@@ -60,8 +58,6 @@ app.use(cors({
     return callback(new Error('Origin is not allowed by CORS'));
   }
 }));
-
-app.use(express.json({ limit: '30kb' }));
 
 app.use('/api', rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -160,6 +156,3 @@ async function shutdown() {
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
-
-// auth route registered below
-
