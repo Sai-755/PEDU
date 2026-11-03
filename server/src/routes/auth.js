@@ -9,7 +9,7 @@ const router = Router();
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 10,
+  limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: 'Too many attempts. Please try again in 15 minutes.' }
@@ -23,8 +23,7 @@ const forgotLimiter = rateLimit({
   message: { message: 'Too many reset requests. Please wait a few minutes before trying again.' }
 });
 
-// Password strength policy:
-// At least 8 characters, 1 uppercase, 1 lowercase, 1 number, and 1 special character
+// Password strength policy: 8+ chars, 1 uppercase, 1 lowercase, 1 number, 1 special char
 const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]).{8,}$/;
 
 function validatePasswordStrength(password) {
@@ -34,7 +33,69 @@ function validatePasswordStrength(password) {
   return null;
 }
 
-// 1. Learner Registration
+// 1. Current Authenticated User (Fixes GET /api/auth/me)
+router.get('/me', async (req, res) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ message: 'Authentication required.' });
+    }
+
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+      return res.status(503).json({ message: 'Authentication secret not configured.' });
+    }
+
+    const decoded = jwt.verify(token, jwtSecret);
+    const [rows] = await db.execute(
+      'SELECT id, name, email, phone, email_verified_at, created_at FROM users WHERE id = ?',
+      [decoded.id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    const user = rows[0];
+    return res.json({
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        emailVerified: Boolean(user.email_verified_at),
+        createdAt: user.created_at
+      }
+    });
+  } catch (err) {
+    return res.status(401).json({ message: 'Your session is invalid or has expired. Please sign in again.' });
+  }
+});
+
+// 2. Update Learner Profile
+router.put('/me', async (req, res, next) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ message: 'Authentication required.' });
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const { name, phone } = req.body || {};
+
+    if (!name?.trim()) {
+      return res.status(400).json({ message: 'Name is required.' });
+    }
+
+    await db.execute('UPDATE users SET name = ?, phone = ? WHERE id = ?', [name.trim(), phone?.trim() || null, decoded.id]);
+
+    return res.json({ message: 'Profile updated successfully.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 3. Learner Registration
 router.post('/register', authLimiter, async (req, res, next) => {
   try {
     const { name, email, password, phone } = req.body || {};
@@ -66,7 +127,7 @@ router.post('/register', authLimiter, async (req, res, next) => {
   }
 });
 
-// 2. Learner Login
+// 4. Learner Login
 router.post('/login', authLimiter, async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
@@ -117,7 +178,7 @@ router.post('/login', authLimiter, async (req, res, next) => {
   }
 });
 
-// 3. Request Password Reset Link (Sends via Brevo)
+// 5. Forgot Password (Dynamically detects Live Production URL)
 router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
   try {
     const { email } = req.body || {};
@@ -134,7 +195,7 @@ router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
 
     const user = users[0];
     const resetToken = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour expiration
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
     await db.execute(`
       CREATE TABLE IF NOT EXISTS password_resets (
@@ -154,8 +215,11 @@ router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
       [cleanEmail, resetToken, expiresAt]
     );
 
-    const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+    // Dynamically detect domain from origin/referer so it points to production live URL
+    const incomingOrigin = req.get('origin') || (req.get('referer') ? new URL(req.get('referer')).origin : null);
+    const clientUrl = (incomingOrigin || process.env.CLIENT_URL || 'https://education-institution.onrender.com').replace(/\/$/, '');
     const resetLink = `${clientUrl}/reset-password?token=${resetToken}`;
+
     const apiKey = process.env.BREVO_API_KEY || process.env.BREVO_KEY;
     const rawFrom = process.env.EMAIL_FROM || 'pvgjeducation@gmail.com';
     const fromEmail = (rawFrom.match(/<([^>]+)>/) ? rawFrom.match(/<([^>]+)>/)[1] : rawFrom).trim();
@@ -200,7 +264,7 @@ router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
   }
 });
 
-// 4. Reset Password with Token
+// 6. Reset Password with Token
 router.post('/reset-password', authLimiter, async (req, res, next) => {
   try {
     const { token, newPassword } = req.body || {};
