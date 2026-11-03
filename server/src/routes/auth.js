@@ -1,351 +1,238 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { rateLimit } from 'express-rate-limit';
 import db from '../db.js';
 
 const router = Router();
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
-const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-let schemaReady;
 
-async function ensureAccountTables() {
-  if (!schemaReady) schemaReady = (async () => {
-    await db.execute(`CREATE TABLE IF NOT EXISTS users (
-      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-      name VARCHAR(120) NOT NULL,
-      email VARCHAR(254) NOT NULL UNIQUE,
-      password_hash VARCHAR(255) NOT NULL,
-      email_verified_at TIMESTAMP NULL DEFAULT NULL,
-      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
-    const [columns] = await db.execute("SHOW COLUMNS FROM users LIKE 'email_verified_at'");
-    if (!columns.length) await db.execute('ALTER TABLE users ADD COLUMN email_verified_at TIMESTAMP NULL DEFAULT NULL AFTER password_hash');
-    const [phoneColumns] = await db.execute("SHOW COLUMNS FROM users LIKE 'phone'");
-    if (!phoneColumns.length) await db.execute('ALTER TABLE users ADD COLUMN phone VARCHAR(30) NULL AFTER email');
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many attempts. Please try again in 15 minutes.' }
+});
 
-    await db.execute(`CREATE TABLE IF NOT EXISTS saved_jobs (
-      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-      user_id BIGINT UNSIGNED NOT NULL,
-      job_id VARCHAR(512) NOT NULL,
-      title VARCHAR(300) NOT NULL,
-      category VARCHAR(100) NULL,
-      source_url VARCHAR(2048) NOT NULL,
-      saved_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY user_saved_job (user_id, job_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
-    await db.execute("CREATE TABLE IF NOT EXISTS job_applications (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, user_id BIGINT UNSIGNED NOT NULL, job_id VARCHAR(512) NOT NULL, title VARCHAR(300) NOT NULL, category VARCHAR(100) NULL, source_url VARCHAR(2048) NOT NULL, status ENUM('Interested','Applied','Interview','Offer','Rejected') NOT NULL DEFAULT 'Interested', notes TEXT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY user_application_job (user_id, job_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-    await db.execute("CREATE TABLE IF NOT EXISTS saved_searches (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, user_id BIGINT UNSIGNED NOT NULL, name VARCHAR(120) NOT NULL, keywords VARCHAR(200) NOT NULL DEFAULT '', category VARCHAR(150) NOT NULL DEFAULT '', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY user_saved_search (user_id, name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-  })().catch((error) => { schemaReady = null; throw error; });
-  await schemaReady;
-}
+const forgotLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many reset requests. Please wait a few minutes before trying again.' }
+});
 
-function issueToken(user) {
-  if (!process.env.JWT_SECRET) throw new Error('Authentication is not configured. Set JWT_SECRET in server/.env.');
-  return jwt.sign({ sub: String(user.id), role: 'learner', email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d', issuer: 'pvgj-api', audience: 'pvgj-user' });
-}
+// Password strength policy:
+// At least 8 characters, 1 uppercase, 1 lowercase, 1 number, and 1 special character
+const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]).{8,}$/;
 
-function currentUser(req) {
-  const match = (req.headers.authorization || '').match(/^Bearer\s+(\S+)$/i);
-  if (!match || !process.env.JWT_SECRET) return null;
-  try {
-    const payload = jwt.verify(match[1], process.env.JWT_SECRET, { algorithms: ['HS256'], issuer: 'pvgj-api', audience: 'pvgj-user' });
-    return payload.role === 'learner' ? payload : null;
-  } catch { return null; }
-}
-
-function requireUser(req, res) {
-  const user = currentUser(req);
-  if (!user) { res.status(401).json({ message: 'Please sign in to continue.' }); return null; }
-  return user;
-}
-
-function verificationUrl(userId, email) {
-  const token = jwt.sign({ sub: String(userId), email, purpose: 'email-verification' }, process.env.JWT_SECRET, { expiresIn: '24h', issuer: 'pvgj-api', audience: 'pvgj-email-verification' });
-  const apiBase = (process.env.API_BASE_URL || 'http://localhost:5000/api').replace(/\/+$/, '');
-  return apiBase + '/auth/verify-email?token=' + encodeURIComponent(token);
-}
-
-async function sendVerificationEmail(email, url) {
-  const apiKey = process.env.BREVO_API_KEY || process.env.BREVO_KEY;
-  const rawFrom = process.env.EMAIL_FROM || 'pvgjeducation@gmail.com';
-  // Extracts pure email address even if formatted like "PVGJ <email@domain.com>"
-  const fromEmail = (rawFrom.match(/<([^>]+)>/) ? rawFrom.match(/<([^>]+)>/)[1] : rawFrom).trim();
-
-  if (!apiKey) {
-    if (process.env.NODE_ENV === 'production') {
-      console.error('[EMAIL CONFIG ERROR] Missing BREVO_API_KEY in environment variables.');
-      throw new Error('Email verification is not configured. Missing: BREVO_API_KEY');
-    }
-    console.info('PVGJ email verification link for ' + email + ': ' + url);
-    return;
+function validatePasswordStrength(password) {
+  if (typeof password !== 'string' || !PASSWORD_REGEX.test(password)) {
+    return 'Password must be at least 8 characters long and contain at least one uppercase letter, one lowercase letter, one number, and one special character.';
   }
-
-  const payload = {
-    sender: { name: 'PVGJ', email: fromEmail },
-    to: [{ email }],
-    subject: 'Verify your PVGJ account',
-    htmlContent: `
-      <div style="font-family: Arial, sans-serif; padding: 24px; color: #173b2d; max-width: 500px; margin: auto; border: 1px solid #e1e8df; border-radius: 12px;">
-        <h2 style="color: #173b2d;">Welcome to PVGJ</h2>
-        <p>Please click the button below to verify your email address and activate your learner account:</p>
-        <div style="margin: 28px 0;">
-          <a href="${url}" style="background-color: #173b2d; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
-            Verify Email Address
-          </a>
-        </div>
-        <p style="color: #666; font-size: 13px;">This link will expire in 24 hours.</p>
-        <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;" />
-        <p style="font-size: 11px; color: #999;">If you didn't create an account with PVGJ, please disregard this email.</p>
-      </div>
-    `
-  };
-
-  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
-    headers: {
-      'accept': 'application/json',
-      'api-key': apiKey,
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    console.error('[BREVO REST ERROR]:', response.status, errorBody);
-    throw new Error(`Brevo HTTP error: ${response.status} - ${errorBody}`);
-  }
-
-  const result = await response.json();
-  console.log('[EMAIL SUCCESS] Verification email sent via Brevo. Message ID:', result.messageId);
+  return null;
 }
 
-router.post('/signup', authLimiter, async (req, res, next) => {
+// 1. Learner Registration
+router.post('/register', authLimiter, async (req, res, next) => {
   try {
-    const { name, email, password } = req.body || {};
-    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-    if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 120 || !emailPattern.test(cleanEmail) || cleanEmail.length > 254 || typeof password !== 'string' || password.length < 8 || password.length > 128) {
-      return res.status(400).json({ message: 'Enter your name, a valid email, and a password of at least 8 characters.' });
-    }
-    if (!process.env.JWT_SECRET) return res.status(503).json({ message: 'Authentication is not configured. Set JWT_SECRET in server/.env.' });
-    
-    await ensureAccountTables();
-    const passwordHash = await bcrypt.hash(password, 12);
-    const [result] = await db.execute('INSERT INTO users (name, email, password_hash, email_verified_at) VALUES (?, ?, ?, NULL)', [name.trim(), cleanEmail, passwordHash]);
-    const url = verificationUrl(result.insertId, cleanEmail);
+    const { name, email, password, phone } = req.body || {};
 
-    try {
-      await sendVerificationEmail(cleanEmail, url);
-    } catch (error) {
-      console.error('[SIGNUP ERROR] Email sending failed for user ID', result.insertId, ':', error.message);
-      await db.execute('DELETE FROM users WHERE id = ? AND email_verified_at IS NULL', [result.insertId]);
-      error.verificationEmailFailed = true;
-      throw error;
+    if (!name?.trim() || !email?.trim() || !password) {
+      return res.status(400).json({ message: 'Name, email, and password are required.' });
     }
 
-    res.set('Cache-Control', 'no-store');
-    return res.status(201).json({
-      message: 'Account created. Check your inbox and follow the verification link before signing in.',
-      verificationUrl: process.env.NODE_ENV === 'production' ? undefined : url
-    });
-  } catch (error) {
-    if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'An account with this email already exists. Sign in instead.' });
-    if (error.verificationEmailFailed) {
-      return res.status(503).json({ message: 'We could not send the verification email. Check your SMTP settings and try again.' });
+    const passwordError = validatePasswordStrength(password);
+    if (passwordError) {
+      return res.status(400).json({ message: passwordError });
     }
-    console.error('[SIGNUP UNHANDLED ERROR]:', error);
-    next(error);
+
+    const cleanEmail = email.trim().toLowerCase();
+    const [existing] = await db.execute('SELECT id FROM users WHERE email = ?', [cleanEmail]);
+    if (existing.length > 0) {
+      return res.status(409).json({ message: 'An account with this email already exists.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 12);
+    await db.execute(
+      'INSERT INTO users (name, email, password_hash, phone) VALUES (?, ?, ?, ?)',
+      [name.trim(), cleanEmail, hashedPassword, phone?.trim() || null]
+    );
+
+    return res.status(201).json({ message: 'Registration successful! You can now sign in.' });
+  } catch (err) {
+    next(err);
   }
 });
 
-router.get('/verify-email', async (req, res, next) => {
-  try {
-    const token = typeof req.query.token === 'string' ? req.query.token : '';
-    const payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'], issuer: 'pvgj-api', audience: 'pvgj-email-verification' });
-    if (payload.purpose !== 'email-verification' || !payload.sub || !emailPattern.test(payload.email || '')) return res.status(400).json({ message: 'This verification link is invalid.' });
-    await ensureAccountTables();
-    await db.execute('UPDATE users SET email_verified_at = COALESCE(email_verified_at, CURRENT_TIMESTAMP) WHERE id = ? AND email = ?', [payload.sub, payload.email]);
-    const [rows] = await db.execute('SELECT email_verified_at FROM users WHERE id = ? AND email = ?', [payload.sub, payload.email]);
-    if (!rows.length) return res.status(400).json({ message: 'This verification link is invalid.' });
-    const message = 'Your email address is verified. You can now sign in.';
-    if (req.accepts('html')) {
-      res.set('Cache-Control', 'no-store');
-      return res.type('html').send('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Email verified - PVGJ</title><body style="font-family:Arial,sans-serif;background:#f4f6f1;color:#173b2d;display:grid;place-items:center;min-height:100vh;margin:0"><main style="max-width:480px;margin:24px;padding:36px;background:white;border:1px solid #e1e8df;border-radius:16px"><h1>Email verified</h1><p>Your PVGJ email address is verified. Return to the PVGJ website and sign in.</p></main></body></html>');
-    }
-    return res.json({ verified: Boolean(rows[0].email_verified_at), message });
-  } catch (error) {
-    if (error.name === 'TokenExpiredError' || error.name === 'JsonWebTokenError') return res.status(400).json({ message: 'This verification link is invalid or has expired.' });
-    next(error);
-  }
-});
-
+// 2. Learner Login
 router.post('/login', authLimiter, async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
-    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-    if (!emailPattern.test(cleanEmail) || typeof password !== 'string' || password.length > 128) return res.status(400).json({ message: 'Enter a valid email and password.' });
-    await ensureAccountTables();
-    const [rows] = await db.execute('SELECT id, name, email, password_hash, email_verified_at FROM users WHERE email = ?', [cleanEmail]);
-    if (!rows.length) {
-      await bcrypt.compare(password, '$2a$12$C6UzMDM.H6dfI/f/IKcEe.8fzPzQPE6xWqTdC5ZdQf9IYBN2kZ4eW');
-      return res.status(401).json({ message: 'Incorrect email or password.' });
-    }
-    const matches = await bcrypt.compare(password, rows[0].password_hash);
-    if (!matches) return res.status(401).json({ message: 'Incorrect email or password.' });
-    if (!rows[0].email_verified_at) {
-      const url = verificationUrl(rows[0].id, rows[0].email);
-      await sendVerificationEmail(rows[0].email, url);
-      return res.status(403).json({ message: 'Verify your email using the link we just sent before signing in.', verificationUrl: process.env.NODE_ENV === 'production' ? undefined : url });
-    }
-    const user = { id: rows[0].id, name: rows[0].name, email: rows[0].email, emailVerified: Boolean(rows[0].email_verified_at) };
-    res.set('Cache-Control', 'no-store');
-    return res.json({ token: issueToken(user), user });
-  } catch (error) { next(error); }
-});
 
-router.get('/me', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    await ensureAccountTables();
-    const [rows] = await db.execute('SELECT id, name, email, phone, email_verified_at, created_at FROM users WHERE id = ?', [payload.sub]);
-    if (!rows.length) return res.status(401).json({ message: 'Your account could not be found. Please sign in again.' });
+    if (!email?.trim() || !password) {
+      return res.status(400).json({ message: 'Email and password are required.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const [rows] = await db.execute(
+      'SELECT id, name, email, password_hash, phone, email_verified_at FROM users WHERE email = ?',
+      [cleanEmail]
+    );
+
+    if (rows.length === 0) {
+      return res.status(401).json({ message: 'Invalid email or password.' });
+    }
+
     const user = rows[0];
-    return res.json({ user: { ...user, emailVerified: Boolean(user.email_verified_at) } });
-  } catch (error) { next(error); }
-});
-
-router.patch('/me', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    const { name, phone } = req.body || {};
-    if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 120) return res.status(400).json({ message: 'Your name must be between 2 and 120 characters.' });
-    if (phone !== undefined && phone !== null && (typeof phone !== 'string' || phone.length > 30 || !/^[+()\-\s\d]*$/.test(phone))) return res.status(400).json({ message: 'Enter a valid phone number.' });
-    await ensureAccountTables();
-    await db.execute('UPDATE users SET name = ?, phone = ? WHERE id = ?', [name.trim(), phone?.trim() || null, payload.sub]);
-    const [rows] = await db.execute('SELECT id, name, email, phone, email_verified_at, created_at FROM users WHERE id = ?', [payload.sub]);
-    if (!rows.length) return res.status(404).json({ message: 'Account not found.' });
-    return res.json({ user: { ...rows[0], emailVerified: Boolean(rows[0].email_verified_at) } });
-  } catch (error) { next(error); }
-});
-
-router.get('/saved-jobs', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    await ensureAccountTables();
-    const [rows] = await db.execute('SELECT job_id AS id, title, category, source_url AS sourceUrl, saved_at AS savedAt FROM saved_jobs WHERE user_id = ? ORDER BY saved_at DESC LIMIT 200', [payload.sub]);
-    return res.json({ jobs: rows });
-  } catch (error) { next(error); }
-});
-
-router.post('/saved-jobs', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    const { id, title, category, sourceUrl } = req.body || {};
-    let url;
-    try { url = new URL(sourceUrl); } catch { return res.status(400).json({ message: 'This job alert cannot be saved.' }); }
-    if (typeof id !== 'string' || !id || id.length > 512 || typeof title !== 'string' || !title.trim() || title.trim().length > 300 || !['https:', 'http:'].includes(url.protocol) || !/(^|\.)freejobalert\.com$/i.test(url.hostname) || !url.pathname.startsWith('/articles/')) return res.status(400).json({ message: 'This job alert cannot be saved.' });
-    await ensureAccountTables();
-    await db.execute('INSERT INTO saved_jobs (user_id, job_id, title, category, source_url) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE title=VALUES(title), category=VALUES(category), source_url=VALUES(source_url)', [payload.sub, id, title.trim(), typeof category === 'string' ? category.slice(0, 100) : null, url.href]);
-    return res.status(201).json({ saved: true, id });
-  } catch (error) { next(error); }
-});
-
-router.delete('/saved-jobs/:jobId', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    await ensureAccountTables();
-    await db.execute('DELETE FROM saved_jobs WHERE user_id = ? AND job_id = ?', [payload.sub, req.params.jobId]);
-    return res.json({ saved: false });
-  } catch (error) { next(error); }
-});
-
-const applicationStatuses = ['Interested', 'Applied', 'Interview', 'Offer', 'Rejected'];
-function validTrackedJobUrl(sourceUrl) {
-  try {
-    const url = new URL(sourceUrl);
-    return ['https:', 'http:'].includes(url.protocol) && /(^|\.)freejobalert\.com$/i.test(url.hostname) && url.pathname.startsWith('/articles/') ? url.href : null;
-  } catch { return null; }
-}
-
-router.get('/applications', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    await ensureAccountTables();
-    const [rows] = await db.execute('SELECT job_id AS id, title, category, source_url AS sourceUrl, status, notes, created_at AS createdAt, updated_at AS updatedAt FROM job_applications WHERE user_id=? ORDER BY updated_at DESC LIMIT 200', [payload.sub]);
-    return res.json({ applications: rows });
-  } catch (error) { next(error); }
-});
-
-router.post('/applications', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    const { id, title, category, sourceUrl } = req.body || {};
-    const cleanUrl = validTrackedJobUrl(sourceUrl);
-    if (typeof id !== 'string' || !id || id.length > 512 || typeof title !== 'string' || !title.trim() || title.trim().length > 300 || !cleanUrl) return res.status(400).json({ message: 'This job alert cannot be added to your tracker.' });
-    await ensureAccountTables();
-    await db.execute('INSERT INTO job_applications (user_id, job_id, title, category, source_url) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE title=VALUES(title), category=VALUES(category), source_url=VALUES(source_url)', [payload.sub, id, title.trim(), typeof category === 'string' ? category.slice(0, 100) : null, cleanUrl]);
-    return res.status(201).json({ tracked: true, id });
-  } catch (error) { next(error); }
-});
-
-router.patch('/applications/:jobId', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    const { status, notes } = req.body || {};
-    if (status !== undefined && !applicationStatuses.includes(status)) return res.status(400).json({ message: 'Choose a valid application stage.' });
-    if (notes !== undefined && (typeof notes !== 'string' || notes.length > 2000)) return res.status(400).json({ message: 'Notes must be 2,000 characters or fewer.' });
-    await ensureAccountTables();
-    const [result] = await db.execute('UPDATE job_applications SET status=COALESCE(?, status), notes=COALESCE(?, notes) WHERE user_id=? AND job_id=?', [status || null, notes === undefined ? null : notes, payload.sub, req.params.jobId]);
-    if (!result.affectedRows) {
-      const [existing] = await db.execute('SELECT job_id FROM job_applications WHERE user_id=? AND job_id=?', [payload.sub, req.params.jobId]);
-      if (!existing.length) return res.status(404).json({ message: 'Tracked job not found.' });
+    const passwordValid = await bcrypt.compare(password, user.password_hash);
+    if (!passwordValid) {
+      return res.status(401).json({ message: 'Invalid email or password.' });
     }
-    return res.json({ updated: true });
-  } catch (error) { next(error); }
-});
 
-router.delete('/applications/:jobId', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    await ensureAccountTables();
-    await db.execute('DELETE FROM job_applications WHERE user_id=? AND job_id=?', [payload.sub, req.params.jobId]);
-    return res.json({ tracked: false });
-  } catch (error) { next(error); }
-});
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+      return res.status(503).json({ message: 'Server authentication configuration is incomplete.' });
+    }
 
-router.get('/saved-searches', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    await ensureAccountTables();
-    const [rows] = await db.execute('SELECT id, name, keywords, category, created_at AS createdAt FROM saved_searches WHERE user_id=? ORDER BY created_at DESC LIMIT 50', [payload.sub]);
-    return res.json({ searches: rows });
-  } catch (error) { next(error); }
-});
+    const token = jwt.sign(
+      { id: user.id, email: user.email, name: user.name, role: 'learner' },
+      jwtSecret,
+      { expiresIn: '7d' }
+    );
 
-router.post('/saved-searches', async (req, res, next) => {
-  try {
-    const payload = requireUser(req, res); if (!payload) return;
-    const { name, keywords = '', category = '' } = req.body || {};
-    if (typeof name !== 'string' || !name.trim() || name.trim().length > 120 || typeof keywords !== 'string' || keywords.length > 200 || typeof category !== 'string' || category.length > 150 || (!keywords.trim() && !category.trim())) return res.status(400).json({ message: 'Add a name and at least one search keyword or category.' });
-    await ensureAccountTables();
-    const [result] = await db.execute('INSERT INTO saved_searches (user_id, name, keywords, category) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE keywords=VALUES(keywords), category=VALUES(category)', [payload.sub, name.trim(), keywords.trim(), category.trim()]);
-    return res.status(201).json({ saved: true, id: result.insertId || null });
-  } catch (error) {
-    if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'A saved search with this name already exists.' });
-    next(error);
+    return res.json({
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        emailVerified: Boolean(user.email_verified_at)
+      }
+    });
+  } catch (err) {
+    next(err);
   }
 });
 
-router.delete('/saved-searches/:id', async (req, res, next) => {
+// 3. Request Password Reset Link (Sends via Brevo)
+router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
   try {
-    const payload = requireUser(req, res); if (!payload) return;
-    await ensureAccountTables();
-    await db.execute('DELETE FROM saved_searches WHERE user_id=? AND id=?', [payload.sub, req.params.id]);
-    return res.json({ saved: false });
-  } catch (error) { next(error); }
+    const { email } = req.body || {};
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ message: 'Please provide a valid email address.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const [users] = await db.execute('SELECT id, name FROM users WHERE email = ?', [cleanEmail]);
+
+    if (users.length === 0) {
+      return res.json({ message: 'If an account exists with this email, a reset link has been dispatched.' });
+    }
+
+    const user = users[0];
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour expiration
+
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS password_resets (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(254) NOT NULL,
+        token VARCHAR(128) NOT NULL,
+        expires_at DATETIME NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_pwd_resets_token (token),
+        INDEX idx_pwd_resets_email (email)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    await db.execute('DELETE FROM password_resets WHERE email = ?', [cleanEmail]);
+    await db.execute(
+      'INSERT INTO password_resets (email, token, expires_at) VALUES (?, ?, ?)',
+      [cleanEmail, resetToken, expiresAt]
+    );
+
+    const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+    const resetLink = `${clientUrl}/reset-password?token=${resetToken}`;
+    const apiKey = process.env.BREVO_API_KEY || process.env.BREVO_KEY;
+    const rawFrom = process.env.EMAIL_FROM || 'pvgjeducation@gmail.com';
+    const fromEmail = (rawFrom.match(/<([^>]+)>/) ? rawFrom.match(/<([^>]+)>/)[1] : rawFrom).trim();
+
+    if (apiKey) {
+      const emailPayload = {
+        sender: { name: 'PVGJ Support', email: fromEmail },
+        to: [{ email: cleanEmail, name: user.name }],
+        replyTo: { email: fromEmail, name: 'PVGJ Support' },
+        subject: 'Reset your PVGJ account password',
+        htmlContent: `
+          <div style="font-family: Arial, sans-serif; padding: 24px; color: #173b2d; max-width: 580px; margin: auto; border: 1px solid #e1e8df; border-radius: 12px;">
+            <h2 style="color: #173b2d; margin-top: 0;">PVGJ Security</h2>
+            <p>Dear ${user.name},</p>
+            <p>We received a request to reset your password. Click the button below to configure a new password:</p>
+            <div style="text-align: center; margin: 28px 0;">
+              <a href="${resetLink}" style="background-color: #173b2d; color: #ffffff; padding: 12px 26px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+                Reset Password
+              </a>
+            </div>
+            <p style="font-size: 13px; color: #666; line-height: 1.5;">This link will remain active for 60 minutes. If you did not make this request, you can safely ignore this email.</p>
+            <hr style="border: 0; border-top: 1px solid #e1e8df; margin: 20px 0;" />
+            <small style="color: #999;">If the button does not work, copy and paste this link into your browser: <br/>${resetLink}</small>
+          </div>
+        `
+      };
+
+      await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'api-key': apiKey,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify(emailPayload)
+      });
+    }
+
+    return res.json({ message: 'If an account exists with this email, a reset link has been dispatched.' });
+  } catch (err) {
+    next(err);
+  }
 });
 
+// 4. Reset Password with Token
+router.post('/reset-password', authLimiter, async (req, res, next) => {
+  try {
+    const { token, newPassword } = req.body || {};
 
+    if (!token || !newPassword) {
+      return res.status(400).json({ message: 'Token and new password are required.' });
+    }
+
+    const passwordError = validatePasswordStrength(newPassword);
+    if (passwordError) {
+      return res.status(400).json({ message: passwordError });
+    }
+
+    const [records] = await db.execute(
+      'SELECT email FROM password_resets WHERE token = ? AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
+      [token]
+    );
+
+    if (records.length === 0) {
+      return res.status(400).json({ message: 'Password reset link is invalid or has expired.' });
+    }
+
+    const email = records[0].email;
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+
+    await db.execute('UPDATE users SET password_hash = ? WHERE email = ?', [hashedPassword, email]);
+    await db.execute('DELETE FROM password_resets WHERE email = ?', [email]);
+
+    return res.json({ message: 'Password reset successfully. You can now log in.' });
+  } catch (err) {
+    next(err);
+  }
+});
 
 export default router;

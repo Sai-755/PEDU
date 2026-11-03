@@ -8,6 +8,8 @@ import ProfilePage from './ProfilePage.jsx';
 import JobsPage from './pages/JobsPage.jsx';
 import ServicePage from './ServicePage.jsx';
 import LearningHub from './LearningHub.jsx';
+import ForgotPassword from './ForgotPassword.jsx';
+import ResetPassword from './ResetPassword.jsx';
 import './styles.css';
 
 function MainApp() {
@@ -25,8 +27,11 @@ function MainApp() {
       window.removeEventListener('popstate', syncPath);
     };
   }, []);
+
   if (path.startsWith('/admin')) return <AdminDashboard />;
-  if (path === '/signin' || path === '/signup') return <AuthPage />;
+  if (path === '/signin' || path === '/signup' || path === '/login') return <AuthPage />;
+  if (path === '/forgot-password') return <ForgotPassword />;
+  if (path.startsWith('/reset-password')) return <ResetPassword />;
   if (path === '/verify-email') return <VerifyEmailPage />;
   if (path === '/account') return <ProfilePage />;
   if (path === '/about') return <AboutPage />;
