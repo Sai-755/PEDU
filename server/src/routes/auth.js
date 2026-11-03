@@ -9,7 +9,7 @@ const router = Router();
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 20,
+  limit: 30,
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: 'Too many attempts. Please try again in 15 minutes.' }
@@ -17,13 +17,12 @@ const authLimiter = rateLimit({
 
 const forgotLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 5,
+  limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: 'Too many reset requests. Please wait a few minutes before trying again.' }
 });
 
-// Password strength policy: 8+ chars, 1 uppercase, 1 lowercase, 1 number, 1 special char
 const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]).{8,}$/;
 
 function validatePasswordStrength(password) {
@@ -33,24 +32,40 @@ function validatePasswordStrength(password) {
   return null;
 }
 
-// 1. Current Authenticated User (Fixes GET /api/auth/me)
-router.get('/me', async (req, res) => {
+// Authentication Middleware with strict pvgj-api claims matching learning.js
+function authenticateToken(req, res, next) {
+  const match = (req.headers.authorization || '').match(/^Bearer\s+(\S+)$/i);
+  if (!match || !process.env.JWT_SECRET) {
+    return res.status(401).json({ message: 'Authentication required.' });
+  }
+
   try {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ message: 'Authentication required.' });
+    const payload = jwt.verify(match[1], process.env.JWT_SECRET, {
+      algorithms: ['HS256'],
+      issuer: 'pvgj-api',
+      audience: 'pvgj-user'
+    });
+
+    if (payload.role !== 'learner' || !payload.sub) {
+      throw new Error('Invalid learner token');
     }
 
-    const jwtSecret = process.env.JWT_SECRET;
-    if (!jwtSecret) {
-      return res.status(503).json({ message: 'Authentication secret not configured.' });
-    }
+    req.user = {
+      ...payload,
+      id: Number(payload.sub) || payload.id
+    };
+    next();
+  } catch {
+    return res.status(401).json({ message: 'Your session is invalid or has expired. Please sign in again.' });
+  }
+}
 
-    const decoded = jwt.verify(token, jwtSecret);
+// 1. Current Authenticated User (GET /api/auth/me)
+router.get('/me', authenticateToken, async (req, res) => {
+  try {
     const [rows] = await db.execute(
       'SELECT id, name, email, phone, email_verified_at, created_at FROM users WHERE id = ?',
-      [decoded.id]
+      [req.user.id]
     );
 
     if (rows.length === 0) {
@@ -69,37 +84,227 @@ router.get('/me', async (req, res) => {
       }
     });
   } catch (err) {
-    return res.status(401).json({ message: 'Your session is invalid or has expired. Please sign in again.' });
+    return res.status(500).json({ message: 'Unable to retrieve user profile.' });
   }
 });
 
-// 2. Update Learner Profile
-router.put('/me', async (req, res, next) => {
+// 2. Update Profile Handler (Handles BOTH PATCH and PUT /api/auth/me)
+const updateProfileHandler = async (req, res, next) => {
   try {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ message: 'Authentication required.' });
+    const { name, phone, displayName } = req.body || {};
+    const targetName = (name || displayName || '').trim();
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const { name, phone } = req.body || {};
+    const [existing] = await db.execute('SELECT name, phone FROM users WHERE id = ?', [req.user.id]);
+    if (existing.length === 0) return res.status(404).json({ message: 'User not found.' });
 
-    if (!name?.trim()) {
-      return res.status(400).json({ message: 'Name is required.' });
-    }
+    const finalName = targetName || existing[0].name;
+    const finalPhone = phone !== undefined ? (phone?.trim() || null) : existing[0].phone;
 
-    await db.execute('UPDATE users SET name = ?, phone = ? WHERE id = ?', [name.trim(), phone?.trim() || null, decoded.id]);
+    await db.execute('UPDATE users SET name = ?, phone = ? WHERE id = ?', [finalName, finalPhone, req.user.id]);
 
-    return res.json({ message: 'Profile updated successfully.' });
+    const [updated] = await db.execute(
+      'SELECT id, name, email, phone, email_verified_at, created_at FROM users WHERE id = ?',
+      [req.user.id]
+    );
+
+    const user = updated[0];
+    return res.json({
+      message: 'Profile updated successfully.',
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        emailVerified: Boolean(user.email_verified_at),
+        createdAt: user.created_at
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+router.patch('/me', authenticateToken, updateProfileHandler);
+router.put('/me', authenticateToken, updateProfileHandler);
+
+// 3. Saved Searches (GET, POST, DELETE /api/auth/saved-searches)
+router.get('/saved-searches', authenticateToken, async (req, res) => {
+  try {
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS saved_searches (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        user_id BIGINT UNSIGNED NOT NULL,
+        query VARCHAR(255) NOT NULL,
+        filters JSON NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_user_searches (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    const [rows] = await db.execute(
+      'SELECT id, query, filters, created_at FROM saved_searches WHERE user_id = ? ORDER BY id DESC',
+      [req.user.id]
+    );
+    return res.json({ savedSearches: rows || [] });
+  } catch (err) {
+    return res.json({ savedSearches: [] });
+  }
+});
+
+router.post('/saved-searches', authenticateToken, async (req, res, next) => {
+  try {
+    const { query, filters } = req.body || {};
+    if (!query?.trim()) return res.status(400).json({ message: 'Search query is required.' });
+
+    await db.execute(
+      'INSERT INTO saved_searches (user_id, query, filters) VALUES (?, ?, ?)',
+      [req.user.id, query.trim(), filters ? JSON.stringify(filters) : null]
+    );
+    return res.json({ message: 'Search saved successfully.' });
   } catch (err) {
     next(err);
   }
 });
 
-// 3. Learner Registration
+router.delete('/saved-searches/:id', authenticateToken, async (req, res, next) => {
+  try {
+    await db.execute('DELETE FROM saved_searches WHERE user_id = ? AND id = ?', [req.user.id, req.params.id]);
+    return res.json({ message: 'Saved search removed.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 4. Job Applications Tracker (GET & POST /api/auth/applications)
+router.get('/applications', authenticateToken, async (req, res) => {
+  try {
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS job_applications (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        user_id BIGINT UNSIGNED NOT NULL,
+        job_id VARCHAR(128) NOT NULL,
+        status VARCHAR(64) NOT NULL DEFAULT 'Applied',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_user_apps (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    const [rows] = await db.execute(
+      'SELECT * FROM job_applications WHERE user_id = ? ORDER BY id DESC',
+      [req.user.id]
+    );
+    return res.json({ applications: rows || [] });
+  } catch (err) {
+    return res.json({ applications: [] });
+  }
+});
+
+router.post('/applications', authenticateToken, async (req, res, next) => {
+  try {
+    const { jobId, status } = req.body || {};
+    if (!jobId) return res.status(400).json({ message: 'Job ID is required.' });
+
+    await db.execute(
+      'INSERT INTO job_applications (user_id, job_id, status) VALUES (?, ?, ?)',
+      [req.user.id, String(jobId), status || 'Applied']
+    );
+    return res.json({ message: 'Application recorded successfully.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 5. Saved Jobs (GET, POST, DELETE /api/auth/saved-jobs)
+router.get('/saved-jobs', authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT job_id FROM saved_jobs WHERE user_id = ?',
+      [req.user.id]
+    );
+    return res.json({ savedJobs: (rows || []).map(r => String(r.job_id)) });
+  } catch (err) {
+    return res.json({ savedJobs: [] });
+  }
+});
+
+router.post('/saved-jobs', authenticateToken, async (req, res, next) => {
+  try {
+    const { jobId } = req.body || {};
+    if (!jobId) return res.status(400).json({ message: 'Job ID is required.' });
+
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS saved_jobs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        user_id BIGINT UNSIGNED NOT NULL,
+        job_id VARCHAR(128) NOT NULL,
+        UNIQUE KEY uq_user_job (user_id, job_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    await db.execute(
+      'INSERT IGNORE INTO saved_jobs (user_id, job_id) VALUES (?, ?)',
+      [req.user.id, String(jobId)]
+    );
+    return res.json({ message: 'Job alert saved.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete('/saved-jobs/:id', authenticateToken, async (req, res, next) => {
+  try {
+    await db.execute(
+      'DELETE FROM saved_jobs WHERE user_id = ? AND job_id = ?',
+      [req.user.id, String(req.params.id)]
+    );
+    return res.json({ message: 'Job alert removed.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 6. Saved Current Affairs / Bookmarks
+router.get('/saved-affairs', authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT affair_id FROM saved_affairs WHERE user_id = ?',
+      [req.user.id]
+    );
+    return res.json({ savedAffairs: (rows || []).map(r => String(r.affair_id)) });
+  } catch (err) {
+    return res.json({ savedAffairs: [] });
+  }
+});
+
+// 7. Exam Plans & Quiz History Support
+router.get('/exam-plans', authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT * FROM exam_plans WHERE user_id = ? ORDER BY id DESC',
+      [req.user.id]
+    );
+    return res.json({ examPlans: rows || [] });
+  } catch (err) {
+    return res.json({ examPlans: [] });
+  }
+});
+
+router.get('/quiz-history', authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT * FROM quiz_attempts WHERE user_id = ? ORDER BY id DESC',
+      [req.user.id]
+    );
+    return res.json({ quizAttempts: rows || [] });
+  } catch (err) {
+    return res.json({ quizAttempts: [] });
+  }
+});
+
+// 8. Register (POST /api/auth/register)
 router.post('/register', authLimiter, async (req, res, next) => {
   try {
     const { name, email, password, phone } = req.body || {};
-
     if (!name?.trim() || !email?.trim() || !password) {
       return res.status(400).json({ message: 'Name, email, and password are required.' });
     }
@@ -127,11 +332,10 @@ router.post('/register', authLimiter, async (req, res, next) => {
   }
 });
 
-// 4. Learner Login
+// 9. Login (POST /api/auth/login) - signs with issuer and audience
 router.post('/login', authLimiter, async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
-
     if (!email?.trim() || !password) {
       return res.status(400).json({ message: 'Email and password are required.' });
     }
@@ -158,9 +362,20 @@ router.post('/login', authLimiter, async (req, res, next) => {
     }
 
     const token = jwt.sign(
-      { id: user.id, email: user.email, name: user.name, role: 'learner' },
+      { 
+        sub: String(user.id), 
+        id: user.id, 
+        email: user.email, 
+        name: user.name, 
+        role: 'learner' 
+      },
       jwtSecret,
-      { expiresIn: '7d' }
+      { 
+        algorithm: 'HS256',
+        issuer: 'pvgj-api', 
+        audience: 'pvgj-user', 
+        expiresIn: '7d' 
+      }
     );
 
     return res.json({
@@ -178,7 +393,7 @@ router.post('/login', authLimiter, async (req, res, next) => {
   }
 });
 
-// 5. Forgot Password (Dynamically detects Live Production URL)
+// 10. Forgot Password (POST /api/auth/forgot-password)
 router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
   try {
     const { email } = req.body || {};
@@ -195,7 +410,7 @@ router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
 
     const user = users[0];
     const resetToken = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
 
     await db.execute(`
       CREATE TABLE IF NOT EXISTS password_resets (
@@ -215,7 +430,6 @@ router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
       [cleanEmail, resetToken, expiresAt]
     );
 
-    // Dynamically detect domain from origin/referer so it points to production live URL
     const incomingOrigin = req.get('origin') || (req.get('referer') ? new URL(req.get('referer')).origin : null);
     const clientUrl = (incomingOrigin || process.env.CLIENT_URL || 'https://education-institution.onrender.com').replace(/\/$/, '');
     const resetLink = `${clientUrl}/reset-password?token=${resetToken}`;
@@ -234,7 +448,7 @@ router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
           <div style="font-family: Arial, sans-serif; padding: 24px; color: #173b2d; max-width: 580px; margin: auto; border: 1px solid #e1e8df; border-radius: 12px;">
             <h2 style="color: #173b2d; margin-top: 0;">PVGJ Security</h2>
             <p>Dear ${user.name},</p>
-            <p>We received a request to reset your password. Click the button below to configure a new password:</p>
+            <p>We received a request to reset your password. Click the button below to set a new password:</p>
             <div style="text-align: center; margin: 28px 0;">
               <a href="${resetLink}" style="background-color: #173b2d; color: #ffffff; padding: 12px 26px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
                 Reset Password
@@ -264,11 +478,10 @@ router.post('/forgot-password', forgotLimiter, async (req, res, next) => {
   }
 });
 
-// 6. Reset Password with Token
+// 11. Reset Password (POST /api/auth/reset-password)
 router.post('/reset-password', authLimiter, async (req, res, next) => {
   try {
     const { token, newPassword } = req.body || {};
-
     if (!token || !newPassword) {
       return res.status(400).json({ message: 'Token and new password are required.' });
     }

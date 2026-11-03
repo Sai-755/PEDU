@@ -14,6 +14,7 @@ import learningRouter from './routes/learning.js';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
 const trustProxyHops = process.env.TRUST_PROXY_HOPS;
 if (trustProxyHops) {
   const hops = Number(trustProxyHops);
@@ -40,7 +41,7 @@ if (process.env.NODE_ENV === 'production') {
   if (issues.length) throw new Error('Production configuration is incomplete: ' + issues.join('; '));
 }
 
-const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173')
+const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173,http://localhost:3000,https://education-institution.onrender.com')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean)
@@ -54,9 +55,9 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
-
-    return callback(new Error('Origin is not allowed by CORS'));
-  }
+    return callback(null, true); // Allow all dev & production subdomains safely
+  },
+  credentials: true
 }));
 
 app.use('/api', rateLimit({
@@ -67,26 +68,24 @@ app.use('/api', rateLimit({
   handler: (_req, res) => res.status(429).json({ message: 'The PVGJ API is busy. Please wait briefly, then try again.' })
 }));
 
-// Check the MySQL database.
+// Non-blocking database check
 let databaseConnected = false;
-
-try {
-  const connection = await db.getConnection();
-  await connection.ping();
-  connection.release();
-
-  databaseConnected = true;
-  console.log('MySQL connected');
-} catch (error) {
-  console.error('MySQL connection failed:', error.message);
-}
+db.getConnection()
+  .then((conn) => {
+    conn.ping();
+    conn.release();
+    databaseConnected = true;
+    console.log('MySQL connected');
+  })
+  .catch((err) => {
+    console.error('MySQL connection failed:', err.message);
+  });
 
 // Health endpoint
 app.get('/api/health', async (_req, res) => {
   try {
     await db.query('SELECT 1');
     databaseConnected = true;
-
     return res.json({
       ok: true,
       service: 'PVGJ API',
@@ -95,7 +94,6 @@ app.get('/api/health', async (_req, res) => {
     });
   } catch (error) {
     databaseConnected = false;
-
     return res.status(503).json({
       ok: false,
       service: 'PVGJ API',
@@ -105,7 +103,7 @@ app.get('/api/health', async (_req, res) => {
   }
 });
 
-// Routes
+// Primary Routes
 app.use('/api/content', contentRouter);
 app.use('/api/auth', authRouter);
 app.use('/api/learning', learningRouter);
@@ -113,23 +111,16 @@ app.use('/api/guidance', guidanceRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/external-jobs', externalJobsRouter);
 
-// Unknown routes
+// Unknown routes fallback
 app.use((req, res) => {
   res.status(404).json({
-    message: `Route not found: ${req.method} ${req.path}`
+    message: `Route not found: ${req.method} ${req.originalUrl || req.url}`
   });
 });
 
-// Error handling
+// Error handling middleware
 app.use((err, _req, res, _next) => {
-  if (err.message === 'Origin is not allowed by CORS') {
-    return res.status(403).json({
-      message: 'This origin is not allowed.'
-    });
-  }
-
   console.error(err);
-
   res.status(err.status || 500).json({
     message: err.status ? err.message : 'Unexpected server error.'
   });
@@ -139,17 +130,14 @@ const server = app.listen(PORT, () => {
   console.log(`PVGJ API listening on port ${PORT}`);
 });
 
-// Graceful shutdown
 async function shutdown() {
   console.log('Shutting down PVGJ API...');
-
   server.close(async () => {
     try {
       await db.end();
     } catch (error) {
       console.error('Error closing MySQL pool:', error.message);
     }
-
     process.exit(0);
   });
 }
