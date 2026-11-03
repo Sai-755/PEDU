@@ -1,4 +1,3 @@
-
 import { Router } from 'express';
 import db from '../db.js';
 
@@ -17,7 +16,7 @@ router.post('/', async (req, res) => {
       !message.trim()
     ) {
       return res.status(400).json({
-        message: 'Name, email and message are required.'
+        message: 'Name, email, and message are required.'
       });
     }
 
@@ -33,29 +32,31 @@ router.post('/', async (req, res) => {
       });
     }
 
+    // Format subject or append phone if provided
+    const cleanPhone = typeof phone === 'string' && phone.trim() ? phone.trim() : null;
+    let finalSubject = typeof subject === 'string' && subject.trim() ? subject.trim() : 'Talk to PVGJ Inquiry';
+    if (cleanPhone) {
+      finalSubject += ` (Phone: ${cleanPhone})`;
+    }
+
     const [result] = await db.execute(
-      `INSERT INTO guidance_enquiries
-       (name, email, phone, subject, message)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO contact_queries
+       (name, email, subject, message, status)
+       VALUES (?, ?, ?, ?, 'pending')`,
       [
         name.trim(),
-        email.trim(),
-        typeof phone === 'string' && phone.trim()
-          ? phone.trim()
-          : null,
-        typeof subject === 'string' && subject.trim()
-          ? subject.trim()
-          : null,
+        email.trim().toLowerCase(),
+        finalSubject,
         message.trim()
       ]
     );
 
     return res.status(201).json({
-      message: 'Your guidance enquiry was submitted successfully.',
+      message: 'Your inquiry was submitted successfully. Our team will review it and reply via email.',
       id: result.insertId
     });
   } catch (error) {
-    console.error('Guidance enquiry failed:', error.message);
+    console.error('Guidance enquiry submission failed:', error.message);
 
     return res.status(500).json({
       message: 'Unable to submit your enquiry. Please try again.'

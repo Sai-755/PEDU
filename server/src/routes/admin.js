@@ -1,4 +1,3 @@
-
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import { requireAdmin } from '../middleware/adminAuth.js';
@@ -16,6 +15,7 @@ const adminLoginLimiter = rateLimit({
     message: 'Too many login attempts. Please try again in 15 minutes.'
   }
 });
+
 const CONTENT_TABLES = {
   service: {
     table: 'services',
@@ -89,7 +89,6 @@ function validateDate(value) {
   );
 }
 
-
 function normalizePublishAt(value) {
   if (value === null || value === undefined || value === '') return null;
   if (typeof value !== 'string' || value.length > 32 || Number.isNaN(Date.parse(value))) return undefined;
@@ -109,7 +108,6 @@ function normalizePublished(value) {
 }
 
 // Admin login
-
 router.post('/login', adminLoginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -138,7 +136,6 @@ router.post('/login', adminLoginLimiter, async (req, res) => {
     const emailMatches =
       email.trim().toLowerCase() === adminEmail.trim().toLowerCase();
 
-    // Always perform a password-hash comparison, even for a wrong email.
     const passwordMatches = await bcrypt.compare(
       password,
       passwordHash
@@ -179,18 +176,48 @@ router.post('/login', adminLoginLimiter, async (req, res) => {
   }
 });
 
-
 // Every route below this point requires a valid admin JWT.
 router.use(requireAdmin);
 
+let adminTablesReady;
 async function ensureAdminToolsTables() {
-  await db.execute("CREATE TABLE IF NOT EXISTS current_affairs (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(200) NOT NULL, description LONGTEXT NULL, category VARCHAR(100) NULL, official_url VARCHAR(2048) NULL, published_at DATE NULL, publish_at DATETIME NULL, is_published BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, INDEX idx_current_affairs_publish (is_published,publish_at,published_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
-  await db.execute("CREATE TABLE IF NOT EXISTS admin_audit_log (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, admin_email VARCHAR(254) NOT NULL, action VARCHAR(40) NOT NULL, content_kind VARCHAR(40) NOT NULL, content_id BIGINT NULL, title VARCHAR(200) NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_admin_audit_time (created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+  if (!adminTablesReady) {
+    adminTablesReady = (async () => {
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS contact_queries (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          name VARCHAR(120) NOT NULL,
+          email VARCHAR(254) NOT NULL,
+          subject VARCHAR(200) NULL,
+          message TEXT NOT NULL,
+          admin_reply TEXT NULL,
+          status ENUM('pending', 'replied') NOT NULL DEFAULT 'pending',
+          replied_at TIMESTAMP NULL DEFAULT NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      `);
+      await db.execute("CREATE TABLE IF NOT EXISTS current_affairs (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(200) NOT NULL, description LONGTEXT NULL, category VARCHAR(100) NULL, official_url VARCHAR(2048) NULL, published_at DATE NULL, publish_at DATETIME NULL, is_published BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, INDEX idx_current_affairs_publish (is_published,publish_at,published_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+      await db.execute("CREATE TABLE IF NOT EXISTS admin_audit_log (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, admin_email VARCHAR(254) NOT NULL, action VARCHAR(40) NOT NULL, content_kind VARCHAR(40) NOT NULL, content_id BIGINT NULL, title VARCHAR(200) NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_admin_audit_time (created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    })().catch((error) => {
+      adminTablesReady = null;
+      throw error;
+    });
+  }
+  await adminTablesReady;
 }
+
 async function writeAudit(req, action, kind, id, title) {
-  try { await ensureAdminToolsTables(); await db.execute('INSERT INTO admin_audit_log(admin_email,action,content_kind,content_id,title) VALUES(?,?,?,?,?)', [req.admin?.email || 'admin',action,kind,id || null,String(title || '').slice(0,200) || null]); }
-  catch (error) { console.error('Could not record admin audit event:', error.message); }
+  try {
+    await ensureAdminToolsTables();
+    await db.execute(
+      'INSERT INTO admin_audit_log(admin_email,action,content_kind,content_id,title) VALUES(?,?,?,?,?)',
+      [req.admin?.email || 'admin', action, kind, id || null, String(title || '').slice(0, 200) || null]
+    );
+  } catch (error) {
+    console.error('Could not record admin audit event:', error.message);
+  }
 }
+
 const defaultServices = [
   ['Technical Skills & Knowledge', 'Build practical skills through programming, web development, AI, data science, and guided projects.', 'Learn'],
   ['Current Affairs', 'Stay up to date with national and international developments, government schemes, and exam-focused news.', 'Stay informed'],
@@ -200,44 +227,69 @@ const defaultServices = [
   ['Government Exam Preparation', 'Prepare with exam roadmaps, syllabus breakdowns, mock tests, and explained answers.', 'Prepare with purpose'],
   ['Guidance & Mentorship', 'Get direction on education choices, career paths, exam strategy, resumes, and interviews.', 'Move forward']
 ];
+
 let defaultServicesReady;
 async function ensureDefaultServices() {
   if (!defaultServicesReady) defaultServicesReady = (async () => {
     const [rows] = await db.execute('SELECT COUNT(*) AS total FROM services');
     if (Number(rows[0].total) > 0) return;
-    for (const [title, description, category] of defaultServices) await db.execute('INSERT INTO services (title, description, category, is_published) VALUES (?, ?, ?, TRUE)', [title, description, category]);
+    for (const [title, description, category] of defaultServices) {
+      await db.execute('INSERT INTO services (title, description, category, is_published) VALUES (?, ?, ?, TRUE)', [title, description, category]);
+    }
   })().catch((error) => { defaultServicesReady = null; throw error; });
   await defaultServicesReady;
 }
+
+let serviceCoursesReady;
 async function ensureServiceCourses() {
-  await db.execute('CREATE TABLE IF NOT EXISTS service_courses (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, service_id BIGINT UNSIGNED NOT NULL, title VARCHAR(200) NOT NULL, summary TEXT NULL, details LONGTEXT NULL, price DECIMAL(10,2) NOT NULL DEFAULT 0.00, duration VARCHAR(120) NULL, course_level VARCHAR(100) NULL, material_url VARCHAR(2048) NULL, is_published BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, INDEX idx_service_courses_service (service_id, is_published)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+  if (!serviceCoursesReady) {
+    serviceCoursesReady = (async () => {
+      await db.execute('CREATE TABLE IF NOT EXISTS service_courses (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, service_id BIGINT UNSIGNED NOT NULL, title VARCHAR(200) NOT NULL, summary TEXT NULL, details LONGTEXT NULL, price DECIMAL(10,2) NOT NULL DEFAULT 0.00, duration VARCHAR(120) NULL, course_level VARCHAR(100) NULL, material_url VARCHAR(2048) NULL, is_published BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, INDEX idx_service_courses_service (service_id, is_published)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+    })().catch((error) => {
+      serviceCoursesReady = null;
+      throw error;
+    });
+  }
+  await serviceCoursesReady;
 }
+
 function courseData(body) {
   const title = typeof body.title === 'string' ? body.title.trim() : '';
   const priceText = body.price === undefined || body.price === null || body.price === '' ? '0' : String(body.price);
   const price = Number(priceText);
   if (!title || title.length > 200) return { error: 'Enter a course title of up to 200 characters.' };
   if (!/^(?:\d{1,8})(?:\.\d{1,2})?$/.test(priceText) || !Number.isFinite(price) || price > 99999999.99) return { error: 'Enter a valid course price in INR.' };
-  for (const [field, max, label] of [['summary', 2000, 'Summary'], ['details', 30000, 'Course details'], ['duration', 120, 'Duration'], ['courseLevel', 100, 'Course level']]) if (body[field] !== undefined && (typeof body[field] !== 'string' || body[field].length > max)) return { error: label + ' is too long.' };
+  for (const [field, max, label] of [['summary', 2000, 'Summary'], ['details', 30000, 'Course details'], ['duration', 120, 'Duration'], ['courseLevel', 100, 'Course level']]) {
+    if (body[field] !== undefined && (typeof body[field] !== 'string' || body[field].length > max)) return { error: label + ' is too long.' };
+  }
   const materialUrl = body.materialUrl || '';
   if (!validateUrl(materialUrl)) return { error: 'Course material links must use http:// or https://.' };
   const published = body.isPublished === undefined ? 1 : normalizePublished(body.isPublished);
   if (published === null) return { error: 'Choose whether this course is published.' };
   return { data: { title, summary: (body.summary || '').trim() || null, details: (body.details || '').trim() || null, price, duration: (body.duration || '').trim() || null, courseLevel: (body.courseLevel || '').trim() || null, materialUrl: materialUrl || null, isPublished: published } };
 }
-function presentCourse(row) { return { ...row, price: Number(row.price), courseLevel: row.course_level, materialUrl: row.material_url, isPublished: Boolean(row.is_published) }; }
+
+function presentCourse(row) {
+  return { ...row, price: Number(row.price), courseLevel: row.course_level, materialUrl: row.material_url, isPublished: Boolean(row.is_published) };
+}
+
+// Service Courses Routes
 router.get('/services/:serviceId/courses', async (req, res, next) => {
   try {
-    const serviceId = Number(req.params.serviceId); if (!Number.isSafeInteger(serviceId) || serviceId < 1) return res.status(400).json({ message: 'Invalid service ID.' });
+    const serviceId = Number(req.params.serviceId);
+    if (!Number.isSafeInteger(serviceId) || serviceId < 1) return res.status(400).json({ message: 'Invalid service ID.' });
     await ensureServiceCourses();
     const [rows] = await db.execute('SELECT id, service_id, title, summary, details, price, duration, course_level, material_url, is_published, created_at FROM service_courses WHERE service_id = ? ORDER BY created_at DESC', [serviceId]);
     return res.json(rows.map(presentCourse));
   } catch (error) { next(error); }
 });
+
 router.post('/services/:serviceId/courses', async (req, res, next) => {
   try {
-    const serviceId = Number(req.params.serviceId); if (!Number.isSafeInteger(serviceId) || serviceId < 1) return res.status(400).json({ message: 'Invalid service ID.' });
-    const parsed = courseData(req.body || {}); if (parsed.error) return res.status(400).json({ message: parsed.error });
+    const serviceId = Number(req.params.serviceId);
+    if (!Number.isSafeInteger(serviceId) || serviceId < 1) return res.status(400).json({ message: 'Invalid service ID.' });
+    const parsed = courseData(req.body || {});
+    if (parsed.error) return res.status(400).json({ message: parsed.error });
     await ensureServiceCourses();
     const d = parsed.data;
     const [result] = await db.execute('INSERT INTO service_courses (service_id, title, summary, details, price, duration, course_level, material_url, is_published) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [serviceId, d.title, d.summary, d.details, d.price, d.duration, d.courseLevel, d.materialUrl, d.isPublished]);
@@ -245,27 +297,33 @@ router.post('/services/:serviceId/courses', async (req, res, next) => {
     return res.status(201).json(presentCourse(rows[0]));
   } catch (error) { next(error); }
 });
+
 router.put('/services/:serviceId/courses/:courseId', async (req, res, next) => {
   try {
     const serviceId = Number(req.params.serviceId), courseId = Number(req.params.courseId);
     if (!Number.isSafeInteger(serviceId) || serviceId < 1 || !Number.isSafeInteger(courseId) || courseId < 1) return res.status(400).json({ message: 'Invalid course or service ID.' });
-    const parsed = courseData(req.body || {}); if (parsed.error) return res.status(400).json({ message: parsed.error });
-    await ensureServiceCourses(); const d = parsed.data;
+    const parsed = courseData(req.body || {});
+    if (parsed.error) return res.status(400).json({ message: parsed.error });
+    await ensureServiceCourses();
+    const d = parsed.data;
     const [result] = await db.execute('UPDATE service_courses SET title=?, summary=?, details=?, price=?, duration=?, course_level=?, material_url=?, is_published=? WHERE id=? AND service_id=?', [d.title, d.summary, d.details, d.price, d.duration, d.courseLevel, d.materialUrl, d.isPublished, courseId, serviceId]);
     if (!result.affectedRows) return res.status(404).json({ message: 'Course not found in this service.' });
     const [rows] = await db.execute('SELECT id, service_id, title, summary, details, price, duration, course_level, material_url, is_published, created_at FROM service_courses WHERE id=?', [courseId]);
     return res.json(presentCourse(rows[0]));
   } catch (error) { next(error); }
 });
+
 router.delete('/services/:serviceId/courses/:courseId', async (req, res, next) => {
   try {
     const serviceId = Number(req.params.serviceId), courseId = Number(req.params.courseId);
     if (!Number.isSafeInteger(serviceId) || serviceId < 1 || !Number.isSafeInteger(courseId) || courseId < 1) return res.status(400).json({ message: 'Invalid course or service ID.' });
-    await ensureServiceCourses(); const [result] = await db.execute('DELETE FROM service_courses WHERE id=? AND service_id=?', [courseId, serviceId]);
+    await ensureServiceCourses();
+    const [result] = await db.execute('DELETE FROM service_courses WHERE id=? AND service_id=?', [courseId, serviceId]);
     if (!result.affectedRows) return res.status(404).json({ message: 'Course not found in this service.' });
     return res.json({ deleted: true });
   } catch (error) { next(error); }
 });
+
 // Learner management and administration audit trail
 router.get('/learners', async (req, res, next) => {
   try {
@@ -275,6 +333,7 @@ router.get('/learners', async (req, res, next) => {
     return res.json({ learners: rows.map((row) => ({ ...row, emailVerified: Boolean(row.emailVerifiedAt) })) });
   } catch (error) { next(error); }
 });
+
 router.get('/audit-log', async (_req, res, next) => {
   try {
     await ensureAdminToolsTables();
@@ -283,6 +342,7 @@ router.get('/audit-log', async (_req, res, next) => {
   } catch (error) { next(error); }
 });
 
+// Bulk content import
 router.post('/content/bulk', async (req, res, next) => {
   const connection = await db.getConnection();
   try {
@@ -328,22 +388,21 @@ router.post('/content/bulk', async (req, res, next) => {
     next(error);
   } finally { connection.release(); }
 });
+
 // Dashboard overview
 router.get('/overview', async (_req, res, next) => {
   try {
     await ensureAdminToolsTables();
     await ensureServiceCourses();
     const queries = await Promise.all([
-      db.execute('SELECT COUNT(*) AS total FROM guidance_enquiries'),
+      db.execute('SELECT COUNT(*) AS total FROM contact_queries'),
       db.execute('SELECT COUNT(*) AS total FROM services'),
       db.execute('SELECT COUNT(*) AS total FROM study_materials'),
       db.execute('SELECT COUNT(*) AS total FROM job_alerts'),
       db.execute('SELECT COUNT(*) AS total FROM users'),
       db.execute('SELECT COUNT(*) AS total FROM current_affairs'),
       db.execute('SELECT COUNT(*) AS total FROM service_courses'),
-      db.execute(
-        "SELECT COUNT(*) AS total FROM guidance_enquiries WHERE status <> 'Resolved'"
-      )
+      db.execute("SELECT COUNT(*) AS total FROM contact_queries WHERE status = 'pending'")
     ]);
 
     const count = (result) => Number(result[0][0].total);
@@ -364,84 +423,107 @@ router.get('/overview', async (_req, res, next) => {
   }
 });
 
-// List guidance enquiries
-router.get('/enquiries', async (_req, res, next) => {
+// List contact and guidance queries (Talk to PVGJ)
+router.get('/queries', async (_req, res, next) => {
   try {
-    const [rows] = await db.execute(
-      `SELECT id, name, email, phone, subject, message, status, created_at
-       FROM guidance_enquiries
-       ORDER BY created_at DESC
+    await ensureAdminToolsTables();
+    const [queries] = await db.execute(
+      `SELECT id, name, email, subject, message, admin_reply, status, replied_at, created_at 
+       FROM contact_queries 
+       ORDER BY created_at DESC 
        LIMIT 500`
     );
-
-    return res.json(
-      rows.map((row) => ({
-        ...row,
-        status: {
-          New: 'new',
-          'In progress': 'in-progress',
-          Resolved: 'resolved'
-        }[row.status] || 'new'
-      }))
-    );
+    return res.json({ queries });
   } catch (error) {
+    console.error('[ADMIN GET QUERIES ERROR]:', error.message);
     next(error);
   }
 });
 
-// Update enquiry status
-router.patch('/enquiries/:id', async (req, res, next) => {
+// Reply to contact query via Brevo REST API
+router.post('/queries/:id/reply', async (req, res, next) => {
   try {
+    await ensureAdminToolsTables();
     const id = Number(req.params.id);
-    const status = req.body?.status;
-
-    const statusMap = {
-      new: 'New',
-      'in-progress': 'In progress',
-      resolved: 'Resolved'
-    };
+    const { replyMessage } = req.body || {};
 
     if (!Number.isSafeInteger(id) || id < 1) {
-      return res.status(400).json({ message: 'Invalid enquiry ID.' });
+      return res.status(400).json({ message: 'Invalid query ID.' });
     }
 
-    if (!Object.hasOwn(statusMap, status)) {
-      return res.status(400).json({ message: 'Invalid enquiry status.' });
-    }
-
-    const [result] = await db.execute(
-      'UPDATE guidance_enquiries SET status = ? WHERE id = ?',
-      [statusMap[status], id]
-    );
-
-    if (result.affectedRows === 0) {
-      const [existing] = await db.execute(
-        'SELECT id FROM guidance_enquiries WHERE id = ?',
-        [id]
-      );
-
-      if (existing.length === 0) {
-        return res.status(404).json({ message: 'Enquiry not found.' });
-      }
+    if (!replyMessage || typeof replyMessage !== 'string' || !replyMessage.trim()) {
+      return res.status(400).json({ message: 'Reply message cannot be empty.' });
     }
 
     const [rows] = await db.execute(
-      `SELECT id, name, email, phone, subject, message, status, created_at
-       FROM guidance_enquiries WHERE id = ?`,
+      'SELECT email, name, subject, message FROM contact_queries WHERE id = ?',
       [id]
     );
 
-    const item = rows[0];
+    if (!rows.length) {
+      return res.status(404).json({ message: 'Inquiry not found.' });
+    }
 
-    return res.json({
-      ...item,
-      status: {
-        New: 'new',
-        'In progress': 'in-progress',
-        Resolved: 'resolved'
-      }[item.status] || 'new'
+    const query = rows[0];
+    const apiKey = process.env.BREVO_API_KEY || process.env.BREVO_KEY;
+    const rawFrom = process.env.EMAIL_FROM || 'pvgjeducation@gmail.com';
+    const fromEmail = (rawFrom.match(/<([^>]+)>/) ? rawFrom.match(/<([^>]+)>/)[1] : rawFrom).trim();
+
+    if (!apiKey) {
+      return res.status(503).json({ message: 'Email service is not configured. Missing BREVO_API_KEY.' });
+    }
+
+    const emailPayload = {
+      sender: { name: 'PVGJ Support', email: fromEmail },
+      to: [{ email: query.email, name: query.name }],
+      replyTo: { email: fromEmail, name: 'PVGJ Support' },
+      subject: `Response to your inquiry: ${query.subject || 'Talk to PVGJ'}`,
+      htmlContent: `
+        <div style="font-family: Arial, sans-serif; padding: 24px; color: #173b2d; max-width: 600px; margin: auto; border: 1px solid #e1e8df; border-radius: 12px;">
+          <h2 style="color: #173b2d; margin-top: 0;">PVGJ Support</h2>
+          <p>Dear ${query.name},</p>
+          <p>Thank you for reaching out to us. Here is the response to your inquiry:</p>
+          <div style="background-color: #f4f6f1; border-left: 4px solid #173b2d; padding: 16px; margin: 20px 0; border-radius: 4px; line-height: 1.6; color: #173b2d;">
+            ${replyMessage.trim().replace(/\n/g, '<br/>')}
+          </div>
+          <hr style="border: 0; border-top: 1px solid #e1e8df; margin: 24px 0;" />
+          <p style="font-size: 13px; color: #666; margin-bottom: 4px;"><strong>Your Original Message:</strong></p>
+          <blockquote style="font-size: 13px; color: #777; margin: 0; padding-left: 12px; border-left: 2px solid #ccc;">
+            ${query.message.replace(/\n/g, '<br/>')}
+          </blockquote>
+          <p style="font-size: 11px; color: #999; margin-top: 24px;">You can reply directly to this email if you have additional questions.</p>
+        </div>
+      `
+    };
+
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'api-key': apiKey,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(emailPayload)
     });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('[BREVO REPLY ERROR]:', response.status, errText);
+      throw new Error(`Brevo HTTP error: ${response.status} - ${errText}`);
+    }
+
+    await db.execute(
+      `UPDATE contact_queries 
+       SET admin_reply = ?, status = 'replied', replied_at = CURRENT_TIMESTAMP 
+       WHERE id = ?`,
+      [replyMessage.trim(), id]
+    );
+
+    await writeAudit(req, 'replied to inquiry', 'inquiry', id, query.subject || query.name);
+
+    return res.json({ success: true, message: 'Response sent successfully.' });
   } catch (error) {
+    console.error('[ADMIN REPLY HANDLER ERROR]:', error.message);
     next(error);
   }
 });
@@ -536,10 +618,10 @@ router.post('/content', async (req, res, next) => {
         });
       }
       if (field === 'last_date' && !validateDate(body[field])) {
-  return res.status(400).json({
-    message: 'The application last date must use YYYY-MM-DD format.'
-  });
-}
+        return res.status(400).json({
+          message: 'The application last date must use YYYY-MM-DD format.'
+        });
+      }
 
       if (body[field] !== undefined && body[field] !== null) {
         if (typeof body[field] !== 'string') {
@@ -645,16 +727,13 @@ router.put('/content/:id', async (req, res, next) => {
 
         data.is_published = published;
       } else if (field === 'last_date') {
-  if (!validateDate(body[field])) {
-    return res.status(400).json({
-      message: 'The application last date must use YYYY-MM-DD format.'
-    });
-  }
+        if (!validateDate(body[field])) {
+          return res.status(400).json({
+            message: 'The application last date must use YYYY-MM-DD format.'
+          });
+        }
 
-  data.last_date = body[field] || null;
-      
-      
-      
+        data.last_date = body[field] || null;
       } else if (field === config.urlField) {
         if (!validateUrl(body[field])) {
           return res.status(400).json({
@@ -746,4 +825,3 @@ router.delete('/content/:id', async (req, res, next) => {
 });
 
 export default router;
-
